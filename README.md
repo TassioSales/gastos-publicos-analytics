@@ -1,21 +1,24 @@
-# 🏛️ Gastos Públicos Analytics (CEAP)
+# 🏛️ Gastos Públicos Analytics: Cota Parlamentar (CEAP 2019 – 2026)
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![DuckDB](https://img.shields.io/badge/DuckDB-Fast%20Analytical%20DW-FFF000.svg?logo=duckdb&logoColor=black)](https://duckdb.org/)
+[![DuckDB](https://img.shields.io/badge/DuckDB-Analytical%20DW%20Colunar-FFF000.svg?logo=duckdb&logoColor=black)](https://duckdb.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109%2B-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![TailwindCSS](https://img.shields.io/badge/TailwindCSS-Neo--Modern%20UI-38B2AC.svg?logo=tailwind-css&logoColor=white)](https://tailwindcss.com/)
+[![Chart.js](https://img.shields.io/badge/Chart.js-Data%20Viz-FF6384.svg?logo=chartdotjs&logoColor=white)](https://www.chartjs.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B.svg?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![Machine Learning](https://img.shields.io/badge/Machine%20Learning-Ensemble%20%2B%20Forensics-8A2BE2.svg?logo=scikitlearn&logoColor=white)](https://scikit-learn.org/)
 [![CI Pipeline](https://img.shields.io/badge/CI-GitHub_Actions-2088FF.svg?logo=github-actions&logoColor=white)](https://github.com/TassioSales/gastos-publicos-analytics/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **End-to-End Analytics Pipeline, Star Schema Data Warehouse (DuckDB/Parquet), and Machine Learning Anomaly Detection on Brazilian Parliamentary Expenses (CEAP / Dados Abertos).**
+> **Plataforma Analítica Full-Stack de Inteligência Financeira e Auditoria Contínua da Cota para o Exercício da Atividade Parlamentar (CEAP - Câmara dos Deputados). Integra Data Warehouse Dimensional (Star Schema / DuckDB), Suíte Forense e Preditiva de Machine Learning (Ensemble de 4 Modelos, Lei de Benford, K-Means e Séries Temporais) e Dashboard Interativo em Tempo Real.**
 
 ---
 
-## 📌 Visão Geral do Projeto
+## 📌 Visão Geral
 
-O **Gastos Públicos Analytics** é uma plataforma analítica robusta desenvolvida para monitorar, auditar e extrair inteligência a partir dos dados abertos da **Câmara dos Deputados** do Brasil.
+O **Gastos Públicos Analytics** é uma solução de engenharia e ciência de dados projetada para transformar dados brutos e dispersos da **Câmara dos Deputados do Brasil** em inteligência estratégica, governança e transparência pública em escala de produção.
 
-O sistema processa a **Cota para o Exercício da Atividade Parlamentar (CEAP)**, estruturando milhões em gastos públicos em um modelo dimensional analítico (Star Schema) otimizado com **DuckDB** e **Parquet**, aplicando algoritmos estatísticos e **Isolation Forest (Machine Learning)** para detectar automaticamente comportamentos atípicos, fracionamentos e potenciais irregularidades.
+A plataforma cobre a série histórica completa de **2019 a 2026**, armazenando e consultando dezenas de milhões de reais em recibos parlamentares normalizados em um Data Warehouse colunar em **DuckDB**. O motor analítico é capaz de responder a consultas analíticas em milissegundos e detectar padrões atípicos de fraude, superfaturamento ou desvios em tempo real.
 
 ---
 
@@ -23,61 +26,65 @@ O sistema processa a **Cota para o Exercício da Atividade Parlamentar (CEAP)**,
 
 ```mermaid
 flowchart TD
-    subgraph Ingestao ["1. Ingestão & ETL"]
-        API["Câmara dos Deputados REST API"] --> Pipeline["CeapPipeline (Python / Polars / Pandas)"]
-        Pipeline --> Clean["Data Cleansing & Normalization"]
+    subgraph Ingestao ["1. Ingestão & Pipeline ETL"]
+        API["Câmara dos Deputados REST API"] --> Pipeline["CeapPipeline (Multi-ano 2019-2026)"]
+        Pipeline --> Clean["Data Cleansing, Deduplicação & Normalização"]
     end
 
     subgraph DW ["2. Data Warehouse Dimensional (Star Schema)"]
-        Clean --> DimDep["dim_deputado"]
-        Clean --> DimForn["dim_fornecedor"]
-        Clean --> DimCat["dim_categoria"]
-        Clean --> Fact["fact_despesas (DuckDB / Parquet)"]
+        Clean --> DimDep["dim_deputado (Perfil, Partido, UF)"]
+        Clean --> DimForn["dim_fornecedor (CNPJ/CPF Limpo, Razão Social)"]
+        Clean --> DimCat["dim_categoria (Macro e Micro Despesas)"]
+        Clean --> Fact["fact_despesas (DuckDB Colunar / Parquet)"]
+        Fact --> Engine["SpendingWarehouse (Thread-Safe RLock + Cursor Isolation)"]
     end
 
-    subgraph ML ["3. Inteligência & Auditoria"]
-        Fact --> ZScore["Z-Score Estatístico (3σ)"]
-        Fact --> IsoForest["Machine Learning (Isolation Forest)"]
-        Fact --> Rules["Regras Heurísticas (Fim de semana / Fracionamento)"]
+    subgraph ML ["3. Inteligência Forense & Machine Learning"]
+        Engine --> Benford["Auditoria Forense (Lei de Benford & χ²)"]
+        Engine --> Forecast["Previsão Temporal (Ridge Regression + Intervalos 95%)"]
+        Engine --> KMeans["Clusterização Comportamental (K-Means & PCA)"]
+        Engine --> Ensemble["Ensemble de Anomalias (Isolation Forest + LOF + Elliptic + Z-Score)"]
     end
 
-    subgraph Delivery ["4. Camada de Entrega & Visualização"]
-        DW --> FastAPI["FastAPI REST Endpoints"]
-        DW --> Streamlit["Streamlit Interactive Dashboard"]
-        ML --> Alerts["Painel de Auditoria & Alertas"]
+    subgraph Frontend ["4. Interfaces de Usuário & APIs"]
+        Engine --> WebApp["Dashboard Web Interativo (FastAPI / Tailwind / Chart.js :8001)"]
+        Engine --> StreamlitApp["Dashboard Executivo Streamlit (:8501)"]
+        Engine --> RestAPI["API RESTful OpenAPI / Swagger (:8001/docs)"]
     end
 ```
 
 ---
 
-## 🌟 Principais Recursos
+## 🌟 Principais Recursos & Capacidades
 
-1. **Pipeline ETL Resiliente:**
-   - Extração automática de deputados, partidos e recibos fiscais com paginação e rate-limiting.
-   - Normalização de tipos de dados, deduplicação por hash de documento e tratamento de nulos.
-   - Enriquecimento temporal com flags de fim de semana e dias úteis.
+### 1. ⚡ Data Warehouse Dimensional de Alta Performance (DuckDB)
+- **Modelagem Kimball Star Schema:** Total conformidade dimensional entre Fato (`fact_despesas`) e Dimensões (`dim_deputado`, `dim_fornecedor`, `dim_categoria`).
+- **Concorrência e Thread-Safety:** Conexão sincronizada com `threading.RLock()` e isolamento de cursores individuais por requisição worker, garantindo zero colisões de concorrência e tempos de resposta inferiores a **15ms**.
+- **Histórico Multi-Anual (2019–2026):** Filtros dinâmicos por ano (`2019` a `2026` e consolidado geral).
 
-2. **Data Warehouse Dimensional (Kimball Star Schema):**
-   - **`fact_despesas`**: Fato com métricas quantitativas (`valor_documento`, `valor_liquido`), granularidade por recibo fiscal.
-   - **`dim_deputado`**: Dimensão com ID parlamentar, nome político, partido e UF de representação.
-   - **`dim_fornecedor`**: Dimensão de emitentes com CPF/CNPJ limpo e razão social.
-   - **`dim_categoria`**: Classificação granular e agrupamento macro (Transporte, Consultoria, Comunicação, etc.).
-   - Processamento colunar ultra-rápido com **DuckDB** nativo e fallback automático em **SQLite**.
+### 2. 🤖 Suíte Avançada de Machine Learning & Auditoria Forense
+- **Ensemble de 4 Modelos de Detecção de Anomalias:**
+  - **Isolation Forest Multivariado:** Identifica combinações incomuns de valor, categoria e tempo.
+  - **Local Outlier Factor (LOF):** Detecta densidades anômalas locais de gastos entre pares.
+  - **Elliptic Envelope:** Avalia a distância de Mahalanobis robusta em distribuições elípticas.
+  - **Z-Score Estatístico (3σ):** Isola recibos discrepantes por categoria de gasto.
+  - *Classificação de Risco:* Pontuação composta que categoriza alertas em **CRÍTICO**, **ALTO** e **MÉDIO**.
+- **Auditoria Forense com a Lei de Benford:**
+  - Avaliação da distribuição de frequência do primeiro dígito (1 a 9).
+  - Cálculo do **Mean Absolute Deviation (MAD)** e teste de aderência **Qui-Quadrado ($\chi^2$)** com $p\text{-value}$ para detecção de manipulação de notas fiscais, seguindo padrões de conformidade do TCU e CGU.
+- **Clusterização de Perfis Parlamentares (K-Means):**
+  - Agrupamento comportamental dos parlamentares por padrão de desembolso (ex: *Comunicação & Mídia Massiva*, *Logística & Base Eleitoral*, *Consultorias Técnicas*, *Despesas Modestas*).
+- **Previsão de Gastos com Séries Temporais:**
+  - Modelo preditivo linear com regularização **Ridge Regression** e componentes de sazonalidade mensal.
+  - Projeção de desembolsos futuros para 6 a 12 meses com **bandas de confiança estatística de 95%** (limites superior e inferior).
 
-3. **Motor Híbrido de Detecção de Anomalias:**
-   - **Z-Score por Categoria:** Identifica gastos que excedem 3 desvios padrão da média histórica de despesas similares.
-   - **Machine Learning (Isolation Forest):** Detecção não-supervisionada de transações multivariadas anômalas.
-   - **Detecção de Fracionamento:** Alerta sobre múltiplas notas consecutivas de mesmo valor e fornecedor no mesmo dia para desvio de limites licitatórios.
-   - **Gastos de Fim de Semana:** Auditoria de despesas substanciais fora dos dias de sessão parlamentar.
-
-4. **Dashboard Streamlit & FastAPI:**
-   - KPIs executivos em tempo real (Total Gasto, Ticket Médio, Maior Despesa Única).
-   - Gráficos interativos com **Plotly** (Treemaps, barras horizontais, distribuição setorial).
-   - API REST documentada via OpenAPI/Swagger (`/docs`).
+### 3. 🔍 Dossiê / Raio-X Parlamentar & Transparência Granular
+- **Dossiê Individual do Deputado:** Visualização detalhada de qualquer parlamentar em um clique — volume total, ticket médio, maiores fornecedores contratados, distribuição percentual por macro-categoria e lista das despesas mais recentes.
+- **Tabela Interativa de Transações:** Busca em tempo real por nome do deputado, CNPJ, razão social ou número do documento, com paginação e ordenação flexível.
 
 ---
 
-## 📊 Modelo Dimensional (Star Schema)
+## 📊 Modelo Dimensional (Kimball Star Schema)
 
 ```
        +--------------------+
@@ -104,44 +111,74 @@ flowchart TD
        |    valor_documento | N:1      |    dim_categoria   |
        |    valor_liquido   +--------->+--------------------+
        |    is_fim_de_semana|          | PK categoria_key   |
-       +--------------------+          |    tipo_despesa    |
-                                       |    macro_categoria |
+       |    num_documento   |          |    tipo_despesa    |
+       +--------------------+          |    macro_categoria |
                                        +--------------------+
 ```
 
 ---
 
+## 🌐 Endpoints da API RESTful (FastAPI)
+
+| Método | Endpoint | Descrição |
+|:---|:---|:---|
+| `GET` | `/` | Interface Web analítica moderna (Tailwind CSS, Chart.js, Lucide) |
+| `GET` | `/api/v1/health` | Healthcheck do serviço e status do motor DuckDB |
+| `GET` | `/api/v1/kpis` | KPIs consolidados (Total gasto, transações, ticket médio, maior despesa) |
+| `GET` | `/api/v1/years` | Histórico consolidado por ano (2019–2026) |
+| `GET` | `/api/v1/timeline` | Evolução mensal detalhada (mês a mês) para o ano selecionado |
+| `GET` | `/api/v1/parties` | Gastos agregados por partido político |
+| `GET` | `/api/v1/states` | Concentração regional de despesas por Unidade Federativa (UF) |
+| `GET` | `/api/v1/top-categories` | Despesas agregadas por tipo e macro-categoria |
+| `GET` | `/api/v1/deputies` | Ranking dos parlamentares com maiores gastos |
+| `GET` | `/api/v1/deputies/list` | Lista de parlamentares para dropdowns e filtros |
+| `GET` | `/api/v1/deputies/{nome}/profile` | Dossiê completo / Raio-X financeiro do deputado |
+| `GET` | `/api/v1/suppliers` | Maiores fornecedores e empresas beneficiadas com recursos da CEAP |
+| `GET` | `/api/v1/expenses` | Consulta paginada, filtrável e pesquisável de despesas itemizadas |
+| `GET` | `/api/v1/ml/benford` | Auditoria forense via Lei de Benford com teste $\chi^2$ e conformidade TCU |
+| `GET` | `/api/v1/ml/clusters` | Segmentação comportamental de deputados via K-Means |
+| `GET` | `/api/v1/ml/forecast` | Projeção preditiva temporal de gastos com bandas de confiança 95% |
+| `GET` | `/api/v1/anomalies` | Lista de despesas suspeitas auditadas pelo Ensemble de 4 modelos |
+| `POST` | `/api/v1/etl/run` | Disparo manual sob demanda de extração e recarga de dados da Câmara |
+
+Documentação interativa disponível via **Swagger UI** em `http://localhost:8001/docs`.
+
+---
+
 ## 🚀 Como Executar
 
-### 1. Clonar o Repositório e Instalar Dependências
+### 1. Clonar o Repositório e Configurar o Ambiente
 
 ```bash
 git clone https://github.com/TassioSales/gastos-publicos-analytics.git
 cd gastos-publicos-analytics
 
-# Criar ambiente virtual
+# Criar e ativar ambiente virtual
 python -m venv venv
-source venv/bin/activate  # No Windows: venv\Scripts\activate
+# No Windows:
+.\venv\Scripts\activate
+# No Linux/macOS:
+source venv/bin/activate
 
-# Instalar pacotes
+# Instalar dependências
 pip install -r requirements.txt
 ```
 
-### 2. Iniciar o Dashboard Interativo
+### 2. Iniciar a Plataforma Web Principal (FastAPI + Tailwind UI)
 
 ```bash
-streamlit run src/dashboard.py
+python -m uvicorn src.api:app --host 0.0.0.0 --port 8001
 ```
-Acesse no navegador: `http://localhost:8501`
+Acesse no navegador: **`http://localhost:8001/`**
 
-### 3. Iniciar a API REST (FastAPI)
+### 3. Iniciar o Dashboard Alternativo (Streamlit)
 
 ```bash
-uvicorn src.api:app --reload --port 8000
+python -m streamlit run src/dashboard.py --server.port 8501
 ```
-Swagger UI disponível em: `http://localhost:8000/docs`
+Acesse no navegador: **`http://localhost:8501/`**
 
-### 4. Executar os Testes Unitários
+### 4. Executar os Testes Automatizados
 
 ```bash
 pytest tests/ -v
@@ -149,21 +186,22 @@ pytest tests/ -v
 
 ---
 
-## 🛠️ Tecnologias Utilizadas
+## 🛠️ Tecnologias e Bibliotecas
 
-- **Linguagem:** Python 3.10+
-- **Processamento de Dados:** Pandas, Polars, DuckDB, NumPy, PyArrow
-- **Machine Learning & Estatística:** Scikit-Learn (Isolation Forest), SciPy
-- **APIs & Web:** FastAPI, Uvicorn, Requests, Pydantic
-- **Visualização de Dados:** Streamlit, Plotly Express
-- **Qualidade & CI/CD:** Pytest, Ruff, GitHub Actions
+- **Linguagem Principal:** Python 3.10+
+- **Data Warehouse & Storage:** DuckDB (Colunar OLAP), Apache Parquet, SQLite (Fallback)
+- **Engenharia de Dados & ETL:** Pandas, NumPy, Requests (Resilient Session / Retries)
+- **Machine Learning & Estatística:** Scikit-Learn (`IsolationForest`, `LocalOutlierFactor`, `EllipticEnvelope`, `KMeans`, `Ridge`), SciPy (`chisquare`)
+- **Backend & APIs:** FastAPI, Uvicorn, Pydantic, AnyIO
+- **Frontend & Visualização:** Tailwind CSS (Dark Theme / Glassmorphism), Chart.js, Lucide Icons, Streamlit, Plotly Express
+- **Qualidade, Testes & CI/CD:** Pytest, GitHub Actions
 
 ---
 
 ## 👤 Autor
 
 **Tássio Lucian de Jesus Sales**  
-*Cientista & Analista de Dados | Analytics Engineer*  
+*Cientista & Analista de Dados | Analytics Engineer | AI Developer*  
 📍 Brasília - DF, Brasil  
 🔗 [LinkedIn](https://www.linkedin.com/in/tassio-sales/) | 🐙 [GitHub](https://github.com/TassioSales)
 
@@ -171,4 +209,4 @@ pytest tests/ -v
 
 ## 📄 Licença
 
-Este projeto é distribuído sob a licença **MIT**. Consulte o arquivo `LICENSE` para mais detalhes.
+Este projeto é disponibilizado sob a licença **MIT**. Consulte o arquivo [LICENSE](LICENSE) para mais detalhes.

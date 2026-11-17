@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore")
 
 logger = logging.getLogger(__name__)
 
