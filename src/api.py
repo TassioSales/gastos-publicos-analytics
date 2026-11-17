@@ -18,6 +18,7 @@ import pandas as pd
 from src.pipeline import CeapPipeline
 from src.warehouse import SpendingWarehouse
 from src.anomaly_detector import SpendingAnomalyDetector
+from src.ml_engine import PublicSpendingMLEngine
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ app.add_middleware(
 warehouse = SpendingWarehouse(read_only=True)
 pipeline = CeapPipeline()
 detector = SpendingAnomalyDetector()
+ml_engine = PublicSpendingMLEngine()
 
 
 @app.get("/api/v1/health")
@@ -283,11 +285,67 @@ def get_timeline(ano: Optional[int] = Query(default=None)) -> List[Dict[str, Any
     return records
 
 
+@app.get("/api/v1/ml/benford")
+def get_benford_audit(ano: Optional[int] = Query(default=None)) -> Dict[str, Any]:
+    """Execute Benford's Law forensic analysis and Chi-Square Goodness-of-Fit."""
+    where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
+    query = f"""
+        SELECT f.valor_liquido
+        FROM fact_despesas f
+        {where_clause}
+    """
+    if warehouse.use_duckdb:
+        df = warehouse.conn.execute(query).df()
+    else:
+        df = pd.read_sql_query(query, warehouse.conn)
+    return ml_engine.audit_benfords_law(df)
+
+
+@app.get("/api/v1/ml/clusters")
+def get_deputy_clusters(ano: Optional[int] = Query(default=None)) -> Dict[str, Any]:
+    """Segment deputies into behavioral spending clusters using K-Means."""
+    where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
+    query = f"""
+        SELECT f.despesa_id, f.valor_liquido, f.is_fim_de_semana,
+               d.nome as nome_deputado, d.partido, d.uf,
+               c.macro_categoria, forn.nome_fornecedor
+        FROM fact_despesas f
+        JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+        JOIN dim_categoria c ON f.categoria_key = c.categoria_key
+        JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+        {where_clause}
+    """
+    if warehouse.use_duckdb:
+        df = warehouse.conn.execute(query).df()
+    else:
+        df = pd.read_sql_query(query, warehouse.conn)
+    return ml_engine.cluster_deputy_behavior(df)
+
+
+@app.get("/api/v1/ml/forecast")
+def get_spending_forecast(months: int = Query(default=6, ge=1, le=12)) -> Dict[str, Any]:
+    """Forecast future monthly spending using time series regression with seasonality."""
+    query = """
+        SELECT ano, mes, SUM(valor_liquido) as total_valor
+        FROM fact_despesas
+        WHERE ano IS NOT NULL
+        GROUP BY ano, mes
+        ORDER BY ano ASC, mes ASC
+    """
+    if warehouse.use_duckdb:
+        df = warehouse.conn.execute(query).df()
+    else:
+        df = pd.read_sql_query(query, warehouse.conn)
+    return ml_engine.forecast_spending(df, forecast_months=months)
+
+
 @app.get("/api/v1/anomalies")
 def get_anomalies(
     ano: Optional[int] = Query(default=None),
-    limit: int = Query(default=250, ge=10, le=1000)
+    risk_level: Optional[str] = Query(default=None),
+    limit: int = Query(default=250, ge=1, le=1000)
 ) -> Dict[str, Any]:
+    """Return multi-model ensemble anomalies (Isolation Forest + LOF + Elliptic Envelope + Z-Score)."""
     where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
     query = f"""
         SELECT f.despesa_id, f.data_documento, f.ano, f.mes, f.valor_liquido,
@@ -301,7 +359,7 @@ def get_anomalies(
         LEFT JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
         {where_clause}
         ORDER BY f.valor_liquido DESC
-        LIMIT {limit}
+        LIMIT 5000
     """
     if warehouse.use_duckdb:
         df = warehouse.conn.execute(query).df()
@@ -309,21 +367,35 @@ def get_anomalies(
         df = pd.read_sql_query(query, warehouse.conn)
 
     if df.empty:
-        return {"summary": {"total_anomalies": 0, "anomaly_percentage": 0.0, "total_suspicious_amount_brl": 0.0}, "anomalies": []}
+        return {
+            "summary": {"total_records": 0, "total_anomalies": 0, "anomaly_percentage": 0.0, "total_suspicious_amount_brl": 0.0, "risk_counts": {}},
+            "anomalies": []
+        }
 
-    analyzed = detector.analyze_dataframe(df)
-    summary_raw = detector.summarize_anomalies(analyzed)
+    analyzed = ml_engine.detect_ensemble_anomalies(df)
     outliers = analyzed[analyzed["is_anomaly"] == True]
 
+    if risk_level and risk_level.upper() != "ALL":
+        target = risk_level.upper().replace("Í", "I").replace("É", "E")
+        outliers = outliers[outliers["risk_level"].str.replace("Í", "I").str.replace("É", "E") == target]
+
+    risk_counts = analyzed["risk_level"].value_counts().to_dict()
+    total_suspicious = float(outliers["valor_liquido"].sum()) if not outliers.empty else 0.0
+    pct = (len(outliers) / len(df) * 100) if len(df) > 0 else 0.0
+
     summary = {
-        "total_records": int(summary_raw.get("total_records", 0)),
-        "total_anomalies": int(summary_raw.get("total_anomalies", 0)),
-        "anomaly_percentage": float(summary_raw.get("anomaly_percentage", 0.0)),
-        "total_suspicious_amount_brl": float(summary_raw.get("total_suspicious_amount_brl", 0.0)),
+        "total_records": len(df),
+        "total_anomalies": len(outliers),
+        "anomaly_percentage": round(pct, 2),
+        "total_suspicious_amount_brl": round(total_suspicious, 2),
+        "risk_counts": risk_counts,
     }
 
+    # Slice up to requested limit
+    outliers_page = outliers.head(limit)
+
     clean_records = []
-    for r in outliers.to_dict(orient="records"):
+    for r in outliers_page.to_dict(orient="records"):
         clean_records.append({
             "despesa_id": str(r.get("despesa_id", "")),
             "data_documento": str(r.get("data_documento", ""))[:10],
@@ -337,7 +409,10 @@ def get_anomalies(
             "macro_categoria": str(r.get("macro_categoria") or ""),
             "nome_fornecedor": str(r.get("nome_fornecedor") or ""),
             "cnpj_cpf": str(r.get("cnpj_cpf") or ""),
-            "anomaly_reasons_str": str(r.get("anomaly_reasons_str") or "OUTLIER"),
+            "risk_score": round(float(r.get("risk_score") or 0.0), 1),
+            "risk_level": str(r.get("risk_level") or "MÉDIO"),
+            "models_flagged": list(r.get("models_flagged") or []),
+            "anomaly_reasons_str": str(r.get("anomaly_reasons_str") or "ANOMALIA"),
         })
 
     return {"summary": summary, "anomalies": clean_records}
@@ -618,42 +693,137 @@ def serve_dashboard():
             </div>
         </div>
 
-        <!-- Machine Learning Anomaly Detection Hub -->
-        <div class="glass p-6 rounded-2xl border-rose-500/30">
-            <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 mb-6 pb-4 border-b border-cardBorder">
-                <div>
-                    <h2 class="text-lg font-bold text-rose-300 flex items-center gap-2">
-                        <i data-lucide="shield-alert" class="w-6 h-6 text-rose-500"></i>
-                        Auditoria de Conformidade & Anomalias de Machine Learning
-                    </h2>
-                    <p class="text-xs text-slate-400 font-mono mt-1">
-                        Algoritmos aplicados: <strong>Isolation Forest Multivariado</strong> e <strong>Z-Score Estatístico (3σ)</strong> para detecção de outliers, despesas atípicas em finais de semana e notas fiscais suspeitas.
-                    </p>
+        <!-- ADVANCED MACHINE LEARNING & FORENSIC SUITE -->
+        <div class="space-y-6">
+            <!-- ML Suite Header Card -->
+            <div class="glass p-6 rounded-2xl border-indigo-500/30">
+                <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pb-4 border-b border-cardBorder">
+                    <div>
+                        <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+                            <i data-lucide="brain-circuit" class="w-6 h-6 text-indigo-400"></i>
+                            <span>Inteligência Artificial & Machine Learning Forense</span>
+                            <span class="text-xs px-2.5 py-0.5 rounded-full border border-indigo-500/30 text-indigo-400 font-mono">Ensemble • Benford • K-Means • Forecast</span>
+                        </h2>
+                        <p class="text-xs text-slate-400 font-mono mt-1">
+                            Comitê Não Supervisionado (<strong>Isolation Forest, LOF, Elliptic Envelope</strong>), Teste Forense de <strong>Newcomb-Benford</strong> e Clustering Comportamental de Parlamentares.
+                        </p>
+                    </div>
+                    <!-- Quick Risk Summary Badges -->
+                    <div class="flex flex-wrap items-center gap-2 font-mono text-xs" id="ml-summary-badges">
+                        <span class="px-2.5 py-1 rounded-lg bg-rose-950/80 border border-rose-500/40 text-rose-300 font-bold" id="badge-critico">🚨 0 Críticos</span>
+                        <span class="px-2.5 py-1 rounded-lg bg-amber-950/80 border border-amber-500/40 text-amber-300 font-bold" id="badge-alto">⚠️ 0 Altos</span>
+                        <span class="px-2.5 py-1 rounded-lg bg-yellow-950/80 border border-yellow-500/40 text-yellow-300 font-bold" id="badge-medio">🟡 0 Médios</span>
+                        <span class="px-2.5 py-1 rounded-lg bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 font-bold" id="badge-benford-status">BENFORD: CALCULANDO</span>
+                    </div>
                 </div>
-                <div id="anomaly-badge" class="px-3.5 py-1.5 rounded-full bg-rose-950/60 border border-rose-500/40 text-rose-300 font-mono text-xs font-semibold">
-                    Calculando anomalias...
-                </div>
-            </div>
 
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-xs font-mono">
-                    <thead class="text-slate-400 border-b border-cardBorder pb-2">
-                        <tr>
-                            <th class="py-2.5 px-3">DATA</th>
-                            <th class="py-2.5 px-3">PARLAMENTAR</th>
-                            <th class="py-2.5 px-3">UF/PARTIDO</th>
-                            <th class="py-2.5 px-3">FORNECEDOR</th>
-                            <th class="py-2.5 px-3">CATEGORIA</th>
-                            <th class="py-2.5 px-3 text-right">VALOR (R$)</th>
-                            <th class="py-2.5 px-3 text-center">MOTIVO DO ALERTA</th>
-                        </tr>
-                    </thead>
-                    <tbody id="anomalies-table-body" class="divide-y divide-slate-800/60">
-                        <tr>
-                            <td colspan="7" class="py-6 text-center text-slate-500 font-mono">Carregando auditoria de anomalias...</td>
-                        </tr>
-                    </tbody>
-                </table>
+                <!-- 2 ML Charts: Benford Law & Predictive Forecast -->
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+                    <!-- Chart 1: Benford's Law Forensic Audit -->
+                    <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800">
+                        <div class="flex items-center justify-between mb-3">
+                            <div>
+                                <h3 class="text-sm font-bold text-white flex items-center gap-2 font-mono">
+                                    <i data-lucide="bar-chart-2" class="w-4 h-4 text-cyan-400"></i>
+                                    Auditoria Forense: Lei de Newcomb-Benford (1º Dígito)
+                                </h3>
+                                <p class="text-[11px] text-slate-400 font-mono">Distribuição Observada vs Teórica P(d)=log10(1 + 1/d)</p>
+                            </div>
+                            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300" id="benford-mad-badge">MAD: 0.000</span>
+                        </div>
+                        <div class="h-60">
+                            <canvas id="chartBenford"></canvas>
+                        </div>
+                        <div class="mt-3 text-[10px] font-mono text-slate-400 flex items-center justify-between border-t border-slate-800/80 pt-2">
+                            <span id="benford-conformity-text">Conformidade TCU: Avaliando...</span>
+                            <span id="benford-chi2-text">χ² Stat: 0.00</span>
+                        </div>
+                    </div>
+
+                    <!-- Chart 2: Predictive Spending Forecast -->
+                    <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800">
+                        <div class="flex items-center justify-between mb-3">
+                            <div>
+                                <h3 class="text-sm font-bold text-white flex items-center gap-2 font-mono">
+                                    <i data-lucide="trending-up" class="w-4 h-4 text-indigo-400"></i>
+                                    Projeção Preditiva de Gastos (Próximos 6 Meses)
+                                </h3>
+                                <p class="text-[11px] text-slate-400 font-mono">Modelo Ridge com Sazonalidade & Intervalo de Confiança (95%)</p>
+                            </div>
+                            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-500/40 text-indigo-300" id="forecast-trend-badge">TENDÊNCIA: ...</span>
+                        </div>
+                        <div class="h-60">
+                            <canvas id="chartForecast"></canvas>
+                        </div>
+                        <div class="mt-3 text-[10px] font-mono text-slate-400 flex items-center justify-between border-t border-slate-800/80 pt-2">
+                            <span>Histórico Recente + Projeção Futura</span>
+                            <span id="forecast-slope-text">Variação Mensal: R$ 0,00</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Behavioral Clusters (K-Means) Cards -->
+                <div class="mt-6">
+                    <h3 class="text-xs font-bold text-slate-300 flex items-center gap-2 mb-3 font-mono">
+                        <i data-lucide="network" class="w-4 h-4 text-purple-400"></i>
+                        SEGMENTAÇÃO COMPORTAMENTAL DE PARLAMENTARES (K-MEANS CLUSTERING)
+                    </h3>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3" id="clusters-container">
+                        <div class="p-4 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500 font-mono text-xs">Carregando clusters...</div>
+                    </div>
+                </div>
+
+                <!-- Multi-Model Ensemble Anomaly Audit Table -->
+                <div class="mt-8 pt-6 border-t border-cardBorder">
+                    <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-3 mb-4">
+                        <div>
+                            <h3 class="text-sm font-bold text-rose-300 flex items-center gap-2 font-mono">
+                                <i data-lucide="shield-alert" class="w-4 h-4 text-rose-500"></i>
+                                DESPESAS IDENTIFICADAS PELO COMITÊ ENSEMBLE DE MACHINE LEARNING
+                            </h3>
+                            <p class="text-[11px] text-slate-400 font-mono">
+                                Votação cruzada: <strong>Isolation Forest</strong> (raridade), <strong>LOF</strong> (densidade local), <strong>Elliptic Envelope</strong> (covariância robusta) e <strong>Z-Score (3σ)</strong>.
+                            </p>
+                        </div>
+                        <!-- Risk Filter Pills -->
+                        <div class="flex items-center gap-1.5 font-mono text-xs">
+                            <span class="text-slate-400 text-[11px] mr-1">Filtrar Risco:</span>
+                            <button onclick="filterAnomaliesByRisk('ALL')" class="btn-risk-filter active px-2.5 py-1 rounded-lg border border-slate-700 bg-slate-800 text-slate-200 text-xs" data-risk="ALL">
+                                Todos
+                            </button>
+                            <button onclick="filterAnomaliesByRisk('CRÍTICO')" class="btn-risk-filter px-2.5 py-1 rounded-lg border border-rose-500/40 bg-rose-950/60 text-rose-300 text-xs" data-risk="CRÍTICO">
+                                🚨 Crítico
+                            </button>
+                            <button onclick="filterAnomaliesByRisk('ALTO')" class="btn-risk-filter px-2.5 py-1 rounded-lg border border-amber-500/40 bg-amber-950/60 text-amber-300 text-xs" data-risk="ALTO">
+                                ⚠️ Alto
+                            </button>
+                            <button onclick="filterAnomaliesByRisk('MÉDIO')" class="btn-risk-filter px-2.5 py-1 rounded-lg border border-yellow-500/40 bg-yellow-950/60 text-yellow-300 text-xs" data-risk="MÉDIO">
+                                🟡 Médio
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-xs font-mono">
+                            <thead class="text-slate-400 border-b border-cardBorder pb-2">
+                                <tr>
+                                    <th class="py-2.5 px-3">NÍVEL / SCORE</th>
+                                    <th class="py-2.5 px-3">DATA</th>
+                                    <th class="py-2.5 px-3">PARLAMENTAR</th>
+                                    <th class="py-2.5 px-3">FORNECEDOR</th>
+                                    <th class="py-2.5 px-3">CATEGORIA</th>
+                                    <th class="py-2.5 px-3 text-right">VALOR (R$)</th>
+                                    <th class="py-2.5 px-3">MODELOS QUE VOTARAM / MOTIVOS</th>
+                                </tr>
+                            </thead>
+                            <tbody id="anomalies-table-body" class="divide-y divide-slate-800/60">
+                                <tr>
+                                    <td colspan="7" class="py-6 text-center text-slate-500 font-mono">Carregando auditoria ensemble...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -906,7 +1076,10 @@ def serve_dashboard():
         let chartParties = null;
         let chartStates = null;
         let chartCategories = null;
+        let chartBenford = null;
+        let chartForecast = null;
         let activeYear = null;
+        let activeRiskFilter = 'ALL';
 
         function formatBRL(value) {
             return Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
@@ -1134,36 +1307,8 @@ def serve_dashboard():
                     });
                 });
 
-            // 6. Anomalies Audit Table
-            fetch(`/api/v1/anomalies${yearParam}${year ? '&' : '?'}limit=250`)
-                .then(r => r.json())
-                .then(res => {
-                    const summary = res.summary || {};
-                    const anomalies = res.anomalies || [];
-                    document.getElementById('anomaly-badge').innerText = `🚨 ${anomalies.length} ANOMALIAS (${summary.anomaly_percentage || 0}%)`;
-
-                    const tbody = document.getElementById('anomalies-table-body');
-                    if (anomalies.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-emerald-400">Nenhuma anomalia crítica detectada neste filtro.</td></tr>';
-                        return;
-                    }
-
-                    tbody.innerHTML = anomalies.slice(0, 8).map(a => `
-                        <tr class="hover:bg-slate-800/40 transition">
-                            <td class="py-2.5 px-3 text-slate-300">${a.data_documento || ''}</td>
-                            <td class="py-2.5 px-3 font-semibold text-white">${a.nome_deputado || 'DEPUTADO'}</td>
-                            <td class="py-2.5 px-3 text-cyan-400 font-bold">${a.partido || ''}/${a.uf || ''}</td>
-                            <td class="py-2.5 px-3 text-slate-300 max-w-xs truncate">${a.nome_fornecedor || ''}</td>
-                            <td class="py-2.5 px-3 text-purple-300 max-w-xs truncate">${a.tipo_despesa || ''}</td>
-                            <td class="py-2.5 px-3 text-right font-bold text-rose-400">${formatBRL(a.valor_liquido)}</td>
-                            <td class="py-2.5 px-3 text-center">
-                                <span class="px-2 py-0.5 rounded text-[10px] bg-rose-950/80 border border-rose-500/50 text-rose-300">
-                                    ${a.anomaly_reasons_str || 'OUTLIER'}
-                                </span>
-                            </td>
-                        </tr>
-                    `).join('');
-                });
+            // 6. ML & AI Forensic Suite
+            loadMLSuite(year);
 
             // 7. Deputies Ranking Table
             fetch(`/api/v1/deputies${yearParam}${year ? '&' : '?'}limit=8`)
@@ -1211,6 +1356,256 @@ def serve_dashboard():
             // 9. Load detailed expenses & dropdowns
             loadDeputiesDropdown();
             loadDetailedExpenses(1);
+        }
+
+        // ====================================================================
+        // ADVANCED ML & FORENSIC SUITE ENGINE
+        // ====================================================================
+        function loadMLSuite(year = null) {
+            const yearParam = year ? `?ano=${year}` : '';
+
+            // 1. Benford's Law Forensic Audit
+            fetch(`/api/v1/ml/benford${yearParam}`)
+                .then(r => r.json())
+                .then(data => {
+                    const ctx = document.getElementById('chartBenford').getContext('2d');
+                    if (chartBenford) chartBenford.destroy();
+
+                    const digits = data.digits || [1,2,3,4,5,6,7,8,9];
+                    const observed = data.observed_pct || [];
+                    const expected = data.expected_pct || [];
+
+                    document.getElementById('benford-mad-badge').innerText = `MAD: ${data.mad || '0.000'}`;
+                    document.getElementById('benford-conformity-text').innerText = `Conformidade TCU: ${data.conformity_status || 'AVALIANDO'}`;
+                    document.getElementById('benford-chi2-text').innerText = `χ² Stat: ${data.chi2_stat || '0.00'} (p=${data.p_value || '0.0'})`;
+
+                    const statusBadge = document.getElementById('badge-benford-status');
+                    if (data.forensic_risk === 'BAIXO' || data.forensic_risk === 'MODERADO') {
+                        statusBadge.className = 'px-2.5 py-1 rounded-lg bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 font-bold';
+                        statusBadge.innerText = 'BENFORD: PADRÃO NATURAL';
+                    } else {
+                        statusBadge.className = 'px-2.5 py-1 rounded-lg bg-rose-950/80 border border-rose-500/40 text-rose-300 font-bold';
+                        statusBadge.innerText = 'BENFORD: DESVIO DETECTADO';
+                    }
+
+                    chartBenford = new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels: digits.map(d => `Dígito ${d}`),
+                            datasets: [
+                                {
+                                    label: 'Frequência Real Observada (%)',
+                                    data: observed,
+                                    backgroundColor: '#06b6d4',
+                                    borderRadius: 4
+                                },
+                                {
+                                    label: 'Curva Teórica de Benford (%)',
+                                    data: expected,
+                                    backgroundColor: 'rgba(244, 63, 94, 0.65)',
+                                    borderRadius: 4
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: { position: 'top', labels: { color: '#cbd5e1', font: { size: 10 } } },
+                                tooltip: {
+                                    callbacks: {
+                                        label: ctx => ` ${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(1)}%`
+                                    }
+                                }
+                            },
+                            scales: {
+                                x: { grid: { display: false }, ticks: { color: '#94a3b8' } },
+                                y: {
+                                    grid: { color: 'rgba(255,255,255,0.05)' },
+                                    ticks: { color: '#94a3b8', callback: v => v + '%' }
+                                }
+                            }
+                        }
+                    });
+                });
+
+            // 2. Predictive Spending Forecast
+            fetch('/api/v1/ml/forecast?months=6')
+                .then(r => r.json())
+                .then(data => {
+                    const ctx = document.getElementById('chartForecast').getContext('2d');
+                    if (chartForecast) chartForecast.destroy();
+
+                    const hist = (data.historical || []).slice(-12);
+                    const fore = data.forecast || [];
+
+                    document.getElementById('forecast-trend-badge').innerText = `TENDÊNCIA: ${data.trend || 'ESTÁVEL'}`;
+                    document.getElementById('forecast-slope-text').innerText = `Variação Mensal: ${formatBRL(data.monthly_slope_brl)}`;
+
+                    const labels = [...hist.map(h => h.label), ...fore.map(f => f.label)];
+                    const histData = [...hist.map(h => h.valor), ...Array(fore.length).fill(null)];
+
+                    const lastHistVal = hist.length > 0 ? hist[hist.length - 1].valor : null;
+                    const foreData = [...Array(Math.max(0, hist.length - 1)).fill(null), lastHistVal, ...fore.map(f => f.predicted_valor)];
+                    const upperBounds = [...Array(Math.max(0, hist.length - 1)).fill(null), lastHistVal, ...fore.map(f => f.upper_bound)];
+                    const lowerBounds = [...Array(Math.max(0, hist.length - 1)).fill(null), lastHistVal, ...fore.map(f => f.lower_bound)];
+
+                    chartForecast = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: labels,
+                            datasets: [
+                                {
+                                    label: 'Histórico Real',
+                                    data: histData,
+                                    borderColor: '#38bdf8',
+                                    backgroundColor: '#38bdf8',
+                                    tension: 0.3,
+                                    pointRadius: 4
+                                },
+                                {
+                                    label: 'Previsão ML (Ridge)',
+                                    data: foreData,
+                                    borderColor: '#818cf8',
+                                    borderDash: [5, 5],
+                                    backgroundColor: 'rgba(129, 140, 248, 0.15)',
+                                    tension: 0.3,
+                                    pointRadius: 5,
+                                    pointBackgroundColor: '#818cf8'
+                                },
+                                {
+                                    label: 'Limite Superior (95%)',
+                                    data: upperBounds,
+                                    borderColor: 'rgba(129, 140, 248, 0.3)',
+                                    borderDash: [2, 2],
+                                    pointRadius: 0,
+                                    fill: false
+                                },
+                                {
+                                    label: 'Limite Inferior (95%)',
+                                    data: lowerBounds,
+                                    borderColor: 'rgba(129, 140, 248, 0.3)',
+                                    borderDash: [2, 2],
+                                    pointRadius: 0,
+                                    fill: '-1',
+                                    backgroundColor: 'rgba(129, 140, 248, 0.08)'
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: { position: 'top', labels: { color: '#cbd5e1', font: { size: 9 }, filter: item => !item.text.includes('Limite') } },
+                                tooltip: {
+                                    callbacks: {
+                                        label: ctx => ` ${ctx.dataset.label}: ${formatBRL(ctx.parsed.y)}`
+                                    }
+                                }
+                            },
+                            scales: {
+                                x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#94a3b8', maxRotation: 45 } },
+                                y: {
+                                    grid: { color: 'rgba(255,255,255,0.05)' },
+                                    ticks: { color: '#94a3b8', callback: v => 'R$ ' + (v/1e6).toFixed(1) + 'M' }
+                                }
+                            }
+                        }
+                    });
+                });
+
+            // 3. Behavioral Clusters (K-Means)
+            fetch(`/api/v1/ml/clusters${yearParam}`)
+                .then(r => r.json())
+                .then(data => {
+                    const clusters = data.clusters || [];
+                    const container = document.getElementById('clusters-container');
+                    if (clusters.length === 0) {
+                        container.innerHTML = '<div class="text-slate-500 font-mono text-xs col-span-4">Dados insuficientes para agrupamento K-Means.</div>';
+                        return;
+                    }
+                    container.innerHTML = clusters.map(c => `
+                        <div class="p-4 rounded-xl bg-slate-900/70 border border-slate-700/60 hover:border-indigo-500/50 transition">
+                            <div class="flex items-center justify-between mb-1.5">
+                                <span class="font-bold text-white text-xs truncate" title="${c.name}">${c.name}</span>
+                                <span class="px-1.5 py-0.5 rounded text-[10px] bg-indigo-950 border border-indigo-500/40 text-indigo-300 font-mono font-bold">${c.total_deputies} Deps</span>
+                            </div>
+                            <p class="text-[10px] text-slate-400 font-mono mb-2 line-clamp-2">${c.description}</p>
+                            <div class="flex items-center justify-between text-[11px] font-mono text-cyan-300 font-bold border-t border-slate-800 pt-2">
+                                <span>Média: ${formatBRL(c.avg_spending)}</span>
+                                <span class="text-slate-400 font-normal">Ticket: ${formatBRL(c.avg_ticket)}</span>
+                            </div>
+                        </div>
+                    `).join('');
+                });
+
+            // 4. Load Multi-Model Ensemble Anomalies Table
+            loadEnsembleAnomalies(year, activeRiskFilter);
+        }
+
+        function loadEnsembleAnomalies(year = null, risk = 'ALL') {
+            const yearParam = year ? `&ano=${year}` : '';
+            const riskParam = (risk && risk !== 'ALL') ? `&risk_level=${encodeURIComponent(risk)}` : '';
+            const url = `/api/v1/anomalies?limit=250${yearParam}${riskParam}`;
+
+            fetch(url)
+                .then(r => r.json())
+                .then(res => {
+                    const summary = res.summary || {};
+                    const riskCounts = summary.risk_counts || {};
+                    const anomalies = res.anomalies || [];
+
+                    document.getElementById('badge-critico').innerText = `🚨 ${riskCounts['CRÍTICO'] || 0} Críticos`;
+                    document.getElementById('badge-alto').innerText = `⚠️ ${riskCounts['ALTO'] || 0} Altos`;
+                    document.getElementById('badge-medio').innerText = `🟡 ${riskCounts['MÉDIO'] || 0} Médios`;
+
+                    const tbody = document.getElementById('anomalies-table-body');
+                    if (anomalies.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-emerald-400 font-mono">Nenhuma anomalia identificada com o filtro selecionado.</td></tr>';
+                        return;
+                    }
+
+                    tbody.innerHTML = anomalies.slice(0, 10).map(a => {
+                        const riskBadge = a.risk_level === 'CRÍTICO' 
+                            ? `<span class="px-2 py-0.5 rounded text-[10px] bg-rose-950 border border-rose-500/80 text-rose-300 font-bold">🚨 CRÍTICO (${a.risk_score} pts)</span>`
+                            : a.risk_level === 'ALTO'
+                            ? `<span class="px-2 py-0.5 rounded text-[10px] bg-amber-950 border border-amber-500/70 text-amber-300 font-bold">⚠️ ALTO (${a.risk_score} pts)</span>`
+                            : `<span class="px-2 py-0.5 rounded text-[10px] bg-yellow-950 border border-yellow-500/50 text-yellow-300 font-bold">🟡 MÉDIO (${a.risk_score} pts)</span>`;
+
+                        const modelsBadges = (a.models_flagged || []).map(m => 
+                            `<span class="px-1.5 py-0.2 rounded text-[9px] bg-slate-800 text-slate-300 border border-slate-700">${m}</span>`
+                        ).join(' ');
+
+                        return `
+                            <tr class="hover:bg-slate-800/40 transition">
+                                <td class="py-2.5 px-3 whitespace-nowrap">${riskBadge}</td>
+                                <td class="py-2.5 px-3 text-slate-300 whitespace-nowrap">${a.data_documento || ''}</td>
+                                <td class="py-2.5 px-3 font-semibold text-white">
+                                    <span class="hover:text-cyan-400 cursor-pointer" onclick="openDeputyModal('${a.nome_deputado}')">${a.nome_deputado || 'DEPUTADO'}</span>
+                                    <span class="text-[10px] text-cyan-400 font-bold ml-1">(${a.partido || ''}/${a.uf || ''})</span>
+                                </td>
+                                <td class="py-2.5 px-3 text-slate-300 max-w-xs truncate" title="${a.nome_fornecedor}">${a.nome_fornecedor || ''}</td>
+                                <td class="py-2.5 px-3 text-purple-300 max-w-xs truncate" title="${a.tipo_despesa}">${a.tipo_despesa || ''}</td>
+                                <td class="py-2.5 px-3 text-right font-bold font-mono text-rose-400">${formatBRL(a.valor_liquido)}</td>
+                                <td class="py-2.5 px-3 text-xs">
+                                    <div class="flex flex-wrap gap-1">${modelsBadges}</div>
+                                </td>
+                            </tr>
+                        `;
+                    }).join('');
+                });
+        }
+
+        function filterAnomaliesByRisk(level) {
+            activeRiskFilter = level;
+            document.querySelectorAll('.btn-risk-filter').forEach(btn => {
+                if (btn.getAttribute('data-risk') === level) {
+                    btn.classList.add('active', 'border-indigo-400', 'bg-indigo-900/60');
+                } else {
+                    btn.classList.remove('active', 'border-indigo-400', 'bg-indigo-900/60');
+                }
+            });
+            loadEnsembleAnomalies(activeYear, level);
         }
 
         // ====================================================================
