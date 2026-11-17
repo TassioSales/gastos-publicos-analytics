@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
@@ -27,6 +28,7 @@ class SpendingWarehouse:
     def __init__(self, db_path: str = "data/warehouse/gastos_dw.duckdb", read_only: bool = False):
         self.db_path = db_path
         self.read_only = read_only
+        self._lock = threading.RLock()
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self.use_duckdb = HAS_DUCKDB
 
@@ -130,20 +132,45 @@ class SpendingWarehouse:
         """)
         self.conn.commit()
 
+    def query_df(self, sql: str) -> pd.DataFrame:
+        """Execute a SQL query thread-safely with connection lock and cursor isolation."""
+        with self._lock:
+            if self.use_duckdb:
+                cur = self.conn.cursor()
+                try:
+                    return cur.execute(sql).df()
+                finally:
+                    cur.close()
+            return pd.read_sql_query(sql, self.conn)
+
+    def query_scalar(self, sql: str) -> Any:
+        """Execute a scalar SQL query thread-safely."""
+        with self._lock:
+            if self.use_duckdb:
+                cur = self.conn.cursor()
+                try:
+                    res = cur.execute(sql).fetchone()
+                    return res[0] if res else None
+                finally:
+                    cur.close()
+            df = pd.read_sql_query(sql, self.conn)
+            return df.iloc[0, 0] if not df.empty else None
+
     def reset_and_reload(self) -> None:
         """Wipe existing facts and dimensions to perform a clean multi-year reload."""
-        if self.use_duckdb:
-            self.conn.execute("DELETE FROM fact_despesas")
-            self.conn.execute("DELETE FROM dim_deputado")
-            self.conn.execute("DELETE FROM dim_fornecedor")
-            self.conn.execute("DELETE FROM dim_categoria")
-        else:
-            cur = self.conn.cursor()
-            cur.execute("DELETE FROM fact_despesas")
-            cur.execute("DELETE FROM dim_deputado")
-            cur.execute("DELETE FROM dim_fornecedor")
-            cur.execute("DELETE FROM dim_categoria")
-            self.conn.commit()
+        with self._lock:
+            if self.use_duckdb:
+                self.conn.execute("DELETE FROM fact_despesas")
+                self.conn.execute("DELETE FROM dim_deputado")
+                self.conn.execute("DELETE FROM dim_fornecedor")
+                self.conn.execute("DELETE FROM dim_categoria")
+            else:
+                cur = self.conn.cursor()
+                cur.execute("DELETE FROM fact_despesas")
+                cur.execute("DELETE FROM dim_deputado")
+                cur.execute("DELETE FROM dim_fornecedor")
+                cur.execute("DELETE FROM dim_categoria")
+                self.conn.commit()
 
     def load_dimensions_and_facts(
         self,
@@ -211,42 +238,48 @@ class SpendingWarehouse:
 
         # Store in Warehouse
         if self.use_duckdb:
-            self.conn.register("tmp_dep", dep_df)
-            self.conn.execute("""
-                INSERT OR IGNORE INTO dim_deputado (deputado_key, id_deputado, nome, partido, uf)
-                SELECT key, id, nome, partido, uf FROM tmp_dep
-            """)
+            with self._lock:
+                self.conn.register("tmp_dep", dep_df)
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO dim_deputado (deputado_key, id_deputado, nome, partido, uf)
+                    SELECT key, id, nome, partido, uf FROM tmp_dep
+                """)
 
-            self.conn.register("tmp_forn", fornecedores)
-            self.conn.execute("""
-                INSERT OR IGNORE INTO dim_fornecedor (fornecedor_key, cnpj_cpf, nome_fornecedor)
-                SELECT fornecedor_key, cnpj_cpf, nome_fornecedor FROM tmp_forn
-            """)
+                self.conn.register("tmp_forn", fornecedores)
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO dim_fornecedor (fornecedor_key, cnpj_cpf, nome_fornecedor)
+                    SELECT fornecedor_key, cnpj_cpf, nome_fornecedor FROM tmp_forn
+                """)
 
-            self.conn.register("tmp_cat", categorias)
-            self.conn.execute("""
-                INSERT OR IGNORE INTO dim_categoria (categoria_key, tipo_despesa, macro_categoria)
-                SELECT categoria_key, tipo_despesa, macro_categoria FROM tmp_cat
-            """)
+                self.conn.register("tmp_cat", categorias)
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO dim_categoria (categoria_key, tipo_despesa, macro_categoria)
+                    SELECT categoria_key, tipo_despesa, macro_categoria FROM tmp_cat
+                """)
 
-            fact_cols = fact[[
-                "despesa_id", "deputado_key", "fornecedor_key", "categoria_key",
-                "data_documento", "ano", "mes", "valor_documento", "valor_liquido",
-                "is_fim_de_semana", "num_documento"
-            ]]
-            self.conn.register("tmp_fact", fact_cols)
-            self.conn.execute("""
-                INSERT OR REPLACE INTO fact_despesas
-                SELECT despesa_id, deputado_key, fornecedor_key, categoria_key,
-                       data_documento, ano, mes, valor_documento, valor_liquido,
-                       is_fim_de_semana, num_documento
-                FROM tmp_fact
-            """)
+                fact_cols = fact[[
+                    "despesa_id", "deputado_key", "fornecedor_key", "categoria_key",
+                    "data_documento", "ano", "mes", "valor_documento", "valor_liquido",
+                    "is_fim_de_semana", "num_documento"
+                ]]
+                self.conn.register("tmp_fact", fact_cols)
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO fact_despesas (
+                        despesa_id, deputado_key, fornecedor_key, categoria_key,
+                        data_documento, ano, mes, valor_documento, valor_liquido,
+                        is_fim_de_semana, num_documento
+                    )
+                    SELECT despesa_id, deputado_key, fornecedor_key, categoria_key,
+                           data_documento, ano, mes, valor_documento, valor_liquido,
+                           is_fim_de_semana, num_documento
+                    FROM tmp_fact
+                """)
         else:
-            dep_df.to_sql("dim_deputado", self.conn, if_exists="replace", index=False)
-            fornecedores.to_sql("dim_fornecedor", self.conn, if_exists="replace", index=False)
-            categorias.to_sql("dim_categoria", self.conn, if_exists="replace", index=False)
-            fact.to_sql("fact_despesas", self.conn, if_exists="replace", index=False)
+            with self._lock:
+                dep_df.to_sql("dim_deputado", self.conn, if_exists="replace", index=False)
+                fornecedores.to_sql("dim_fornecedor", self.conn, if_exists="replace", index=False)
+                categorias.to_sql("dim_categoria", self.conn, if_exists="replace", index=False)
+                fact.to_sql("fact_despesas", self.conn, if_exists="replace", index=False)
 
         return {"fact_rows": len(fact), "dim_deputados": len(dep_df)}
 
@@ -264,11 +297,7 @@ class SpendingWarehouse:
             FROM fact_despesas
             {where_clause}
         """
-        if self.use_duckdb:
-            df = self.conn.execute(query).df()
-        else:
-            df = pd.read_sql_query(query, self.conn)
-
+        df = self.query_df(query)
         return df.iloc[0].to_dict() if not df.empty else {}
 
     def get_top_spending_categories(self, ano: Optional[int] = None, limit: int = 10) -> pd.DataFrame:
@@ -287,9 +316,7 @@ class SpendingWarehouse:
             ORDER BY total_valor DESC
             LIMIT {limit}
         """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+        return self.query_df(query)
 
     def get_spending_by_year(self) -> pd.DataFrame:
         """Return historical spending evolution by year (2019-2026)."""
@@ -304,9 +331,7 @@ class SpendingWarehouse:
             GROUP BY ano
             ORDER BY ano ASC
         """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+        return self.query_df(query)
 
     def get_spending_by_party(self, ano: Optional[int] = None, limit: int = 15) -> pd.DataFrame:
         """Return spending grouped by political party, optionally filtered by year."""
@@ -325,9 +350,7 @@ class SpendingWarehouse:
             ORDER BY total_valor DESC
             LIMIT {limit}
         """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+        return self.query_df(query)
 
     def get_spending_by_uf(self, ano: Optional[int] = None, limit: int = 27) -> pd.DataFrame:
         """Return spending grouped by Brazilian State (UF), optionally filtered by year."""
@@ -345,9 +368,7 @@ class SpendingWarehouse:
             ORDER BY total_valor DESC
             LIMIT {limit}
         """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+        return self.query_df(query)
 
     def get_top_suppliers(self, ano: Optional[int] = None, limit: int = 15) -> pd.DataFrame:
         """Return top suppliers / CNPJs receiving public parliamentary funds."""
@@ -367,9 +388,7 @@ class SpendingWarehouse:
             ORDER BY total_valor DESC
             LIMIT {limit}
         """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+        return self.query_df(query)
 
     def get_deputy_ranking(self, ano: Optional[int] = None, limit: int = 25) -> pd.DataFrame:
         """Return top spending deputies ranking, optionally filtered by year."""
@@ -390,17 +409,12 @@ class SpendingWarehouse:
             ORDER BY total_gasto DESC
             LIMIT {limit}
         """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+        return self.query_df(query)
 
     def get_available_years(self) -> List[int]:
         """Return all distinct years present in the warehouse sorted descending."""
         query = "SELECT DISTINCT ano FROM fact_despesas WHERE ano IS NOT NULL ORDER BY ano DESC"
-        if self.use_duckdb:
-            df = self.conn.execute(query).df()
-        else:
-            df = pd.read_sql_query(query, self.conn)
+        df = self.query_df(query)
         return [int(y) for y in df["ano"].tolist()] if not df.empty else []
 
     @staticmethod
@@ -429,10 +443,7 @@ class SpendingWarehouse:
             JOIN fact_despesas f ON d.deputado_key = f.deputado_key
             ORDER BY d.nome ASC
         """
-        if self.use_duckdb:
-            df = self.conn.execute(query).df()
-        else:
-            df = pd.read_sql_query(query, self.conn)
+        df = self.query_df(query)
         return df.to_dict(orient="records") if not df.empty else []
 
     def get_detailed_expenses(
@@ -513,12 +524,8 @@ class SpendingWarehouse:
             LIMIT {limit} OFFSET {offset}
         """
 
-        if self.use_duckdb:
-            total_matching = int(self.conn.execute(count_query).fetchone()[0])
-            df = self.conn.execute(data_query).df()
-        else:
-            total_matching = int(pd.read_sql_query(count_query, self.conn).iloc[0, 0])
-            df = pd.read_sql_query(data_query, self.conn)
+        total_matching = int(self.query_scalar(count_query) or 0)
+        df = self.query_df(data_query)
 
         records = df.to_dict(orient="records") if not df.empty else []
         return {
@@ -597,16 +604,10 @@ class SpendingWarehouse:
             LIMIT 25
         """
 
-        if self.use_duckdb:
-            kpi_df = self.conn.execute(kpi_query).df()
-            sup_df = self.conn.execute(suppliers_query).df()
-            cat_df = self.conn.execute(categories_query).df()
-            rec_df = self.conn.execute(recent_expenses_query).df()
-        else:
-            kpi_df = pd.read_sql_query(kpi_query, self.conn)
-            sup_df = pd.read_sql_query(suppliers_query, self.conn)
-            cat_df = pd.read_sql_query(categories_query, self.conn)
-            rec_df = pd.read_sql_query(recent_expenses_query, self.conn)
+        kpi_df = self.query_df(kpi_query)
+        sup_df = self.query_df(suppliers_query)
+        cat_df = self.query_df(categories_query)
+        rec_df = self.query_df(recent_expenses_query)
 
         if kpi_df.empty:
             return {}

@@ -267,10 +267,7 @@ def get_timeline(ano: Optional[int] = Query(default=None)) -> List[Dict[str, Any
         GROUP BY f.ano, f.mes
         ORDER BY f.ano ASC, f.mes ASC
     """
-    if warehouse.use_duckdb:
-        df = warehouse.conn.execute(query).df()
-    else:
-        df = pd.read_sql_query(query, warehouse.conn)
+    df = warehouse.query_df(query)
 
     if df.empty:
         return []
@@ -294,10 +291,7 @@ def get_benford_audit(ano: Optional[int] = Query(default=None)) -> Dict[str, Any
         FROM fact_despesas f
         {where_clause}
     """
-    if warehouse.use_duckdb:
-        df = warehouse.conn.execute(query).df()
-    else:
-        df = pd.read_sql_query(query, warehouse.conn)
+    df = warehouse.query_df(query)
     return ml_engine.audit_benfords_law(df)
 
 
@@ -315,10 +309,7 @@ def get_deputy_clusters(ano: Optional[int] = Query(default=None)) -> Dict[str, A
         JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
         {where_clause}
     """
-    if warehouse.use_duckdb:
-        df = warehouse.conn.execute(query).df()
-    else:
-        df = pd.read_sql_query(query, warehouse.conn)
+    df = warehouse.query_df(query)
     return ml_engine.cluster_deputy_behavior(df)
 
 
@@ -332,10 +323,7 @@ def get_spending_forecast(months: int = Query(default=6, ge=1, le=12)) -> Dict[s
         GROUP BY ano, mes
         ORDER BY ano ASC, mes ASC
     """
-    if warehouse.use_duckdb:
-        df = warehouse.conn.execute(query).df()
-    else:
-        df = pd.read_sql_query(query, warehouse.conn)
+    df = warehouse.query_df(query)
     return ml_engine.forecast_spending(df, forecast_months=months)
 
 
@@ -361,10 +349,7 @@ def get_anomalies(
         ORDER BY f.valor_liquido DESC
         LIMIT 5000
     """
-    if warehouse.use_duckdb:
-        df = warehouse.conn.execute(query).df()
-    else:
-        df = pd.read_sql_query(query, warehouse.conn)
+    df = warehouse.query_df(query)
 
     if df.empty:
         return {
@@ -1209,8 +1194,10 @@ def serve_dashboard():
 
             // 3. Parties Chart
             fetch(`/api/v1/parties${yearParam}${year ? '&' : '?'}limit=8`)
-                .then(r => r.json())
-                .then(data => {
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => [])
+                .then(raw => {
+                    const data = Array.isArray(raw) ? raw : [];
                     const ctx = document.getElementById('chartParties').getContext('2d');
                     if (chartParties) chartParties.destroy();
 
@@ -1241,8 +1228,10 @@ def serve_dashboard():
 
             // 4. States Chart
             fetch(`/api/v1/states${yearParam}${year ? '&' : '?'}limit=10`)
-                .then(r => r.json())
-                .then(data => {
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => [])
+                .then(raw => {
+                    const data = Array.isArray(raw) ? raw : [];
                     const ctx = document.getElementById('chartStates').getContext('2d');
                     if (chartStates) chartStates.destroy();
 
@@ -1284,15 +1273,17 @@ def serve_dashboard():
 
             // 5. Categories Chart
             fetch(`/api/v1/top-categories${yearParam}${year ? '&' : '?'}limit=6`)
-                .then(r => r.json())
-                .then(data => {
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => [])
+                .then(raw => {
+                    const data = Array.isArray(raw) ? raw : [];
                     const ctx = document.getElementById('chartCategories').getContext('2d');
                     if (chartCategories) chartCategories.destroy();
 
                     chartCategories = new Chart(ctx, {
                         type: 'bar',
                         data: {
-                            labels: data.map(d => d.tipo_despesa.length > 25 ? d.tipo_despesa.slice(0, 25) + '...' : d.tipo_despesa),
+                            labels: data.map(d => (d.tipo_despesa && d.tipo_despesa.length > 25) ? d.tipo_despesa.slice(0, 25) + '...' : (d.tipo_despesa || '')),
                             datasets: [{
                                 label: 'Valor',
                                 data: data.map(d => d.total_valor),
@@ -1328,8 +1319,10 @@ def serve_dashboard():
 
             // 7. Deputies Ranking Table
             fetch(`/api/v1/deputies${yearParam}${year ? '&' : '?'}limit=8`)
-                .then(r => r.json())
-                .then(data => {
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => [])
+                .then(raw => {
+                    const data = Array.isArray(raw) ? raw : [];
                     const tbody = document.getElementById('deputies-table-body');
                     if (!data || data.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">Nenhum parlamentar registrado neste ano.</td></tr>';
@@ -1353,8 +1346,10 @@ def serve_dashboard():
 
             // 8. Top Suppliers Table
             fetch(`/api/v1/suppliers${yearParam}${year ? '&' : '?'}limit=8`)
-                .then(r => r.json())
-                .then(data => {
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => [])
+                .then(raw => {
+                    const data = Array.isArray(raw) ? raw : [];
                     const tbody = document.getElementById('suppliers-table-body');
                     if (!data || data.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="3" class="py-4 text-center text-slate-500">Nenhum fornecedor registrado neste ano.</td></tr>';
@@ -1382,7 +1377,8 @@ def serve_dashboard():
 
             // 1. Benford's Law Forensic Audit
             fetch(`/api/v1/ml/benford${yearParam}`)
-                .then(r => r.json())
+                .then(r => r.ok ? r.json() : {})
+                .catch(() => ({}))
                 .then(data => {
                     const ctx = document.getElementById('chartBenford').getContext('2d');
                     if (chartBenford) chartBenford.destroy();
@@ -1447,7 +1443,8 @@ def serve_dashboard():
 
             // 2. Predictive Spending Forecast
             fetch('/api/v1/ml/forecast?months=6')
-                .then(r => r.json())
+                .then(r => r.ok ? r.json() : {})
+                .catch(() => ({}))
                 .then(data => {
                     const ctx = document.getElementById('chartForecast').getContext('2d');
                     if (chartForecast) chartForecast.destroy();
@@ -1532,7 +1529,8 @@ def serve_dashboard():
 
             // 3. Behavioral Clusters (K-Means)
             fetch(`/api/v1/ml/clusters${yearParam}`)
-                .then(r => r.json())
+                .then(r => r.ok ? r.json() : {})
+                .catch(() => ({}))
                 .then(data => {
                     const clusters = data.clusters || [];
                     const container = document.getElementById('clusters-container');
@@ -1565,7 +1563,8 @@ def serve_dashboard():
             const url = `/api/v1/anomalies?limit=250${yearParam}${riskParam}`;
 
             fetch(url)
-                .then(r => r.json())
+                .then(r => r.ok ? r.json() : {})
+                .catch(() => ({}))
                 .then(res => {
                     const summary = res.summary || {};
                     const riskCounts = summary.risk_counts || {};
