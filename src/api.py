@@ -1085,6 +1085,13 @@ def serve_dashboard():
             return Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
         }
 
+        function formatChartAxis(v) {
+            if (v >= 1e6) return 'R$ ' + (v / 1e6).toFixed(1) + 'M';
+            if (v >= 1e3) return 'R$ ' + (v / 1e3).toFixed(0) + 'k';
+            if (v > 0) return 'R$ ' + v.toFixed(0);
+            return 'R$ 0';
+        }
+
         function setYear(year) {
             activeYear = year;
 
@@ -1122,28 +1129,37 @@ def serve_dashboard():
 
             // 1. KPIs
             fetch(`/api/v1/kpis${yearParam}`)
-                .then(r => r.json())
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
                 .then(k => {
                     document.getElementById('kpi-total-gasto').innerText = formatBRL(k.total_gasto);
-                    document.getElementById('kpi-total-tx').innerText = Number(k.total_transacoes).toLocaleString('pt-BR');
+                    document.getElementById('kpi-total-tx').innerText = Number(k.total_transacoes || 0).toLocaleString('pt-BR');
                     document.getElementById('kpi-ticket-medio').innerText = formatBRL(k.ticket_medio);
                     document.getElementById('kpi-maior-despesa').innerText = formatBRL(k.maior_despesa);
-                    document.getElementById('kpi-sub-deputados').innerText = `${k.total_deputados} Parlamentares Ativos`;
-                    document.getElementById('kpi-sub-fornecedores').innerText = `${k.total_fornecedores} Fornecedores / CNPJs`;
-                    document.getElementById('badge-total-records').innerText = `DUCKDB: ${Number(k.total_transacoes).toLocaleString('pt-BR')} FATOS`;
+                    document.getElementById('kpi-sub-deputados').innerText = `${k.total_deputados || 0} Parlamentares Ativos`;
+                    document.getElementById('kpi-sub-fornecedores').innerText = `${k.total_fornecedores || 0} Fornecedores / CNPJs`;
+                    document.getElementById('badge-total-records').innerText = `DUCKDB: ${Number(k.total_transacoes || 0).toLocaleString('pt-BR')} FATOS`;
                     document.getElementById('kpi-sub-total').innerHTML = year
                         ? `<i data-lucide="calendar" class="w-3.5 h-3.5 inline"></i> Ano Filtrado: ${year}`
                         : `<i data-lucide="calendar" class="w-3.5 h-3.5 inline"></i> Período: 2019 – 2026`;
                     lucide.createIcons();
-                });
+                })
+                .catch(err => console.error("Error loading KPIs:", err));
 
             // 2. Timeline Chart (Annual if year=null, Monthly if year is set)
             const timelineUrl = year ? `/api/v1/timeline?ano=${year}` : '/api/v1/years';
             fetch(timelineUrl)
-                .then(r => r.json())
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
                 .then(data => {
                     const ctx = document.getElementById('chartYears').getContext('2d');
                     if (chartYears) chartYears.destroy();
+
+                    if (!data || data.length === 0) return;
 
                     const labels = year 
                         ? data.map(d => `Mês ${d.mes}`)
@@ -1183,7 +1199,7 @@ def serve_dashboard():
                                     grid: { color: 'rgba(255,255,255,0.05)' },
                                     ticks: {
                                         color: '#94a3b8',
-                                        callback: v => 'R$ ' + (v/1e6).toFixed(1) + 'M'
+                                        callback: v => formatChartAxis(v)
                                     }
                                 }
                             }
@@ -1258,7 +1274,7 @@ def serve_dashboard():
                                     grid: { color: 'rgba(255,255,255,0.05)' },
                                     ticks: {
                                         color: '#94a3b8',
-                                        callback: v => 'R$ ' + (v/1e6).toFixed(1) + 'M'
+                                        callback: v => formatChartAxis(v)
                                     }
                                 }
                             }
@@ -1299,7 +1315,7 @@ def serve_dashboard():
                             scales: {
                                 x: {
                                     grid: { color: 'rgba(255,255,255,0.05)' },
-                                    ticks: { color: '#94a3b8', callback: v => 'R$ ' + (v/1e6).toFixed(1) + 'M' }
+                                    ticks: { color: '#94a3b8', callback: v => formatChartAxis(v) }
                                 },
                                 y: { grid: { display: false }, ticks: { color: '#cbd5e1', font: { size: 9 } } }
                             }
@@ -1507,7 +1523,7 @@ def serve_dashboard():
                                 x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#94a3b8', maxRotation: 45 } },
                                 y: {
                                     grid: { color: 'rgba(255,255,255,0.05)' },
-                                    ticks: { color: '#94a3b8', callback: v => 'R$ ' + (v/1e6).toFixed(1) + 'M' }
+                                    ticks: { color: '#94a3b8', callback: v => formatChartAxis(v) }
                                 }
                             }
                         }
