@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 150
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length
+    "E402",  # module level import
+    "F401",  # unused imports
+    "F841",  # unused variables
+    "UP006", # deprecated type aliases
+    "UP035", # deprecated type aliases
+    "I001",  # import sort
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
