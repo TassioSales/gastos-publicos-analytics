@@ -175,13 +175,22 @@ class SpendingWarehouse:
         # Store in Warehouse
         if self.use_duckdb:
             self.conn.register("tmp_dep", dep_df)
-            self.conn.execute("INSERT OR REPLACE INTO dim_deputado SELECT key, id, nome, partido, uf FROM tmp_dep")
+            self.conn.execute("""
+                INSERT OR IGNORE INTO dim_deputado (deputado_key, id_deputado, nome, partido, uf)
+                SELECT key, id, nome, partido, uf FROM tmp_dep
+            """)
 
             self.conn.register("tmp_forn", fornecedores)
-            self.conn.execute("INSERT OR REPLACE INTO dim_fornecedor SELECT fornecedor_key, cnpj_cpf_fornecedor, nome_fornecedor FROM tmp_forn")
+            self.conn.execute("""
+                INSERT OR IGNORE INTO dim_fornecedor (fornecedor_key, cnpj_cpf, nome_fornecedor)
+                SELECT fornecedor_key, cnpj_cpf_fornecedor, nome_fornecedor FROM tmp_forn
+            """)
 
             self.conn.register("tmp_cat", categorias)
-            self.conn.execute("INSERT OR REPLACE INTO dim_categoria SELECT categoria_key, tipo_despesa, macro_categoria FROM tmp_cat")
+            self.conn.execute("""
+                INSERT OR IGNORE INTO dim_categoria (categoria_key, tipo_despesa, macro_categoria)
+                SELECT categoria_key, tipo_despesa, macro_categoria FROM tmp_cat
+            """)
 
             fact_cols = fact[[
                 "despesa_id", "deputado_key", "fornecedor_key", "categoria_key",
@@ -236,6 +245,125 @@ class SpendingWarehouse:
             GROUP BY c.tipo_despesa, c.macro_categoria
             ORDER BY total_valor DESC
             LIMIT {limit}
+        """
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_spending_by_year(self) -> pd.DataFrame:
+        """Return historical spending evolution by year (2019-2026)."""
+        query = """
+            SELECT
+                ano,
+                COUNT(*) as qtd_recibos,
+                SUM(valor_liquido) as total_valor,
+                AVG(valor_liquido) as ticket_medio
+            FROM fact_despesas
+            WHERE ano IS NOT NULL
+            GROUP BY ano
+            ORDER BY ano ASC
+        """
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_spending_by_party(self, limit: int = 15) -> pd.DataFrame:
+        """Return spending grouped by political party."""
+        query = f"""
+            SELECT
+                COALESCE(d.partido, 'OUTROS') as partido,
+                COUNT(DISTINCT d.id_deputado) as total_deputados,
+                COUNT(f.despesa_id) as qtd_recibos,
+                SUM(f.valor_liquido) as total_valor,
+                AVG(f.valor_liquido) as ticket_medio
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            GROUP BY d.partido
+            ORDER BY total_valor DESC
+            LIMIT {limit}
+        """
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_spending_by_uf(self, limit: int = 27) -> pd.DataFrame:
+        """Return spending grouped by Brazilian State (UF)."""
+        query = f"""
+            SELECT
+                COALESCE(d.uf, 'BR') as uf,
+                COUNT(DISTINCT d.id_deputado) as total_deputados,
+                COUNT(f.despesa_id) as qtd_recibos,
+                SUM(f.valor_liquido) as total_valor
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            GROUP BY d.uf
+            ORDER BY total_valor DESC
+            LIMIT {limit}
+        """
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_top_suppliers(self, limit: int = 15) -> pd.DataFrame:
+        """Return top suppliers / CNPJs receiving public parliamentary funds."""
+        query = f"""
+            SELECT
+                forn.nome_fornecedor,
+                forn.cnpj_cpf,
+                COUNT(f.despesa_id) as qtd_recibos,
+                SUM(f.valor_liquido) as total_valor,
+                AVG(f.valor_liquido) as ticket_medio,
+                MAX(f.valor_liquido) as maior_recibo
+            FROM fact_despesas f
+            JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+            GROUP BY forn.nome_fornecedor, forn.cnpj_cpf
+            ORDER BY total_valor DESC
+            LIMIT {limit}
+        """
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_deputy_ranking(self, limit: int = 25) -> pd.DataFrame:
+        """Return top spending deputies ranking."""
+        query = f"""
+            SELECT
+                d.nome,
+                d.partido,
+                d.uf,
+                COUNT(f.despesa_id) as qtd_recibos,
+                SUM(f.valor_liquido) as total_gasto,
+                AVG(f.valor_liquido) as ticket_medio,
+                MAX(f.valor_liquido) as maior_gasto
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            GROUP BY d.nome, d.partido, d.uf
+            ORDER BY total_gasto DESC
+            LIMIT {limit}
+        """
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_all_deputies(self) -> pd.DataFrame:
+        """Return all distinct deputies registered in warehouse."""
+        query = "SELECT DISTINCT id_deputado, nome, partido, uf FROM dim_deputado ORDER BY nome ASC"
+        if self.use_duckdb:
+            return self.conn.execute(query).df()
+        return pd.read_sql_query(query, self.conn)
+
+    def get_monthly_timeline(self) -> pd.DataFrame:
+        """Return monthly expenditures timeline."""
+        query = """
+            SELECT
+                ano,
+                mes,
+                SUM(valor_liquido) as total_valor,
+                COUNT(*) as qtd_recibos
+            FROM fact_despesas
+            WHERE ano IS NOT NULL AND mes IS NOT NULL
+            GROUP BY ano, mes
+            ORDER BY ano ASC, mes ASC
         """
         if self.use_duckdb:
             return self.conn.execute(query).df()
