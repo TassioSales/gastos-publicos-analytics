@@ -1,18 +1,14 @@
-"""Data Warehouse & Star Schema Modeling for Public Spending Analytics.
+"""Dimensional Data Warehouse for CEAP (Câmara dos Deputados).
 
-Implements Kimball-style dimensional modeling with DuckDB and Parquet storage:
-- fact_despesas (Facts: valor_documento, valor_liquido, glosa)
-- dim_deputado (Deputado surrogate key, nome, partido, uf)
-- dim_fornecedor (Fornecedor surrogate key, cnpj_cpf, nome_fornecedor)
-- dim_tempo (Date key, ano, mes, dia, dia_semana, is_fim_de_semana)
-- dim_categoria (Tipo de despesa, agrupamento macro)
+Implements Kimball Star Schema on DuckDB with Parquet persistence.
+Supports full multi-year historical analysis (2019-2026) and granular year filtering.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import sqlite3
+import logging
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
@@ -34,8 +30,19 @@ class SpendingWarehouse:
         self.use_duckdb = HAS_DUCKDB
 
         if self.use_duckdb:
-            self.conn = duckdb.connect(self.db_path)
-            self._init_duckdb_schema()
+            try:
+                self.conn = duckdb.connect(self.db_path)
+                self._init_duckdb_schema()
+            except Exception as e:
+                logger.warning("DuckDB read-write connection failed (%s). Opening read-only...", e)
+                try:
+                    self.conn = duckdb.connect(self.db_path, read_only=True)
+                except Exception as e2:
+                    logger.error("DuckDB read-only also failed: %s. Falling back to SQLite.", e2)
+                    self.use_duckdb = False
+                    self.sqlite_path = self.db_path.replace(".duckdb", ".db")
+                    self.conn = sqlite3.connect(self.sqlite_path)
+                    self._init_sqlite_schema()
         else:
             self.sqlite_path = self.db_path.replace(".duckdb", ".db")
             self.conn = sqlite3.connect(self.sqlite_path)
@@ -119,35 +126,60 @@ class SpendingWarehouse:
         """)
         self.conn.commit()
 
+    def reset_and_reload(self) -> None:
+        """Wipe existing facts and dimensions to perform a clean multi-year reload."""
+        if self.use_duckdb:
+            self.conn.execute("DELETE FROM fact_despesas")
+            self.conn.execute("DELETE FROM dim_deputado")
+            self.conn.execute("DELETE FROM dim_fornecedor")
+            self.conn.execute("DELETE FROM dim_categoria")
+        else:
+            cur = self.conn.cursor()
+            cur.execute("DELETE FROM fact_despesas")
+            cur.execute("DELETE FROM dim_deputado")
+            cur.execute("DELETE FROM dim_fornecedor")
+            cur.execute("DELETE FROM dim_categoria")
+            self.conn.commit()
+
     def load_dimensions_and_facts(
         self,
         expenses_df: pd.DataFrame,
         deputados_list: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, int]:
-        """Process and load cleaned dataframes into the dimensional model."""
+        """Ingest cleaned DataFrame into Star Schema with Kimball dimensional conformance."""
         if expenses_df.empty:
             return {"fact_rows": 0, "dim_deputados": 0}
 
+        # Build Dim Deputado lookup
         dep_lookup = {}
         if deputados_list:
-            for i, dep in enumerate(deputados_list, start=1):
-                dep_lookup[dep["id"]] = {
-                    "key": i,
-                    "id": dep["id"],
-                    "nome": dep["nome"].upper(),
-                    "partido": dep.get("siglaPartido", "IND").upper(),
-                    "uf": dep.get("siglaUf", "BR").upper(),
+            for idx, d in enumerate(deputados_list, start=1):
+                dep_id = d.get("id")
+                dep_lookup[dep_id] = {
+                    "key": idx,
+                    "id": dep_id,
+                    "nome": str(d.get("nome", f"DEPUTADO_{dep_id}")).upper(),
+                    "partido": str(d.get("siglaPartido") or d.get("partido") or "OUTROS").upper(),
+                    "uf": str(d.get("siglaUf") or d.get("uf") or "DF").upper(),
                 }
 
-        # Build / Load Dim Deputado
-        dep_df = pd.DataFrame(list(dep_lookup.values())) if dep_lookup else pd.DataFrame([
-            {"key": 1, "id": row.get("id_deputado", 0), "nome": f"DEPUTADO_{row.get('id_deputado', 0)}", "partido": "BR", "uf": "DF"}
-            for _, row in expenses_df[["id_deputado"]].drop_duplicates().iterrows()
-        ])
+        unique_dep_ids = expenses_df["id_deputado"].drop_duplicates().tolist()
+        for dep_id in unique_dep_ids:
+            if dep_id not in dep_lookup:
+                dep_lookup[dep_id] = {
+                    "key": len(dep_lookup) + 1,
+                    "id": dep_id,
+                    "nome": f"DEPUTADO_{dep_id}",
+                    "partido": "OUTROS",
+                    "uf": "BR",
+                }
+
+        dep_df = pd.DataFrame(list(dep_lookup.values()))
 
         # Build Dim Fornecedor
         fornecedores = expenses_df[["cnpj_cpf_fornecedor", "nome_fornecedor"]].drop_duplicates().reset_index(drop=True)
         fornecedores["fornecedor_key"] = range(1, len(fornecedores) + 1)
+        fornecedores = fornecedores.rename(columns={"cnpj_cpf_fornecedor": "cnpj_cpf"})
 
         # Build Dim Categoria
         categorias = expenses_df[["tipo_despesa"]].drop_duplicates().reset_index(drop=True)
@@ -156,21 +188,22 @@ class SpendingWarehouse:
 
         # Merge surrogate keys onto fact
         fact = expenses_df.copy()
-        fact = fact.merge(fornecedores, on=["cnpj_cpf_fornecedor", "nome_fornecedor"], how="left")
+        fact = fact.merge(fornecedores, left_on=["cnpj_cpf_fornecedor", "nome_fornecedor"], right_on=["cnpj_cpf", "nome_fornecedor"], how="left")
         fact = fact.merge(categorias, on="tipo_despesa", how="left")
 
-        if not dep_df.empty:
-            dep_key_map = dict(zip(dep_df["id"], dep_df["key"]))
-            fact["deputado_key"] = fact["id_deputado"].map(dep_key_map).fillna(1).astype(int)
-        else:
-            fact["deputado_key"] = 1
+        dep_key_map = dict(zip(dep_df["id"], dep_df["key"]))
+        fact["deputado_key"] = fact["id_deputado"].map(dep_key_map).fillna(1).astype(int)
 
         fact["despesa_id"] = (
             fact["id_deputado"].astype(str) + "_" +
+            fact["ano"].astype(str) + "_" +
+            fact["mes"].astype(str) + "_" +
             fact["num_documento"].astype(str) + "_" +
-            fact["data_documento"].astype(str) + "_" +
             fact.index.astype(str)
         )
+
+        # Filter out negative or zero refunds for clean spending analytics
+        fact = fact[fact["valor_liquido"] > 0].copy()
 
         # Store in Warehouse
         if self.use_duckdb:
@@ -183,7 +216,7 @@ class SpendingWarehouse:
             self.conn.register("tmp_forn", fornecedores)
             self.conn.execute("""
                 INSERT OR IGNORE INTO dim_fornecedor (fornecedor_key, cnpj_cpf, nome_fornecedor)
-                SELECT fornecedor_key, cnpj_cpf_fornecedor, nome_fornecedor FROM tmp_forn
+                SELECT fornecedor_key, cnpj_cpf, nome_fornecedor FROM tmp_forn
             """)
 
             self.conn.register("tmp_cat", categorias)
@@ -213,9 +246,10 @@ class SpendingWarehouse:
 
         return {"fact_rows": len(fact), "dim_deputados": len(dep_df)}
 
-    def get_summary_kpis(self) -> Dict[str, Any]:
-        """Return high-level KPIs across the analytical warehouse."""
-        query = """
+    def get_summary_kpis(self, ano: Optional[int] = None) -> Dict[str, Any]:
+        """Return high-level KPIs across the analytical warehouse, optionally filtered by year."""
+        where_clause = f"WHERE ano = {int(ano)}" if ano else ""
+        query = f"""
             SELECT
                 COUNT(*) as total_transacoes,
                 COALESCE(SUM(valor_liquido), 0.0) as total_gasto,
@@ -224,6 +258,7 @@ class SpendingWarehouse:
                 COUNT(DISTINCT deputado_key) as total_deputados,
                 COUNT(DISTINCT fornecedor_key) as total_fornecedores
             FROM fact_despesas
+            {where_clause}
         """
         if self.use_duckdb:
             df = self.conn.execute(query).df()
@@ -232,8 +267,9 @@ class SpendingWarehouse:
 
         return df.iloc[0].to_dict() if not df.empty else {}
 
-    def get_top_spending_categories(self, limit: int = 10) -> pd.DataFrame:
-        """Return spending aggregated by category."""
+    def get_top_spending_categories(self, ano: Optional[int] = None, limit: int = 10) -> pd.DataFrame:
+        """Return spending aggregated by category, optionally filtered by year."""
+        where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
         query = f"""
             SELECT
                 c.tipo_despesa,
@@ -242,6 +278,7 @@ class SpendingWarehouse:
                 SUM(f.valor_liquido) as total_valor
             FROM fact_despesas f
             JOIN dim_categoria c ON f.categoria_key = c.categoria_key
+            {where_clause}
             GROUP BY c.tipo_despesa, c.macro_categoria
             ORDER BY total_valor DESC
             LIMIT {limit}
@@ -259,7 +296,7 @@ class SpendingWarehouse:
                 SUM(valor_liquido) as total_valor,
                 AVG(valor_liquido) as ticket_medio
             FROM fact_despesas
-            WHERE ano IS NOT NULL
+            WHERE ano IS NOT NULL AND valor_liquido > 0
             GROUP BY ano
             ORDER BY ano ASC
         """
@@ -267,8 +304,9 @@ class SpendingWarehouse:
             return self.conn.execute(query).df()
         return pd.read_sql_query(query, self.conn)
 
-    def get_spending_by_party(self, limit: int = 15) -> pd.DataFrame:
-        """Return spending grouped by political party."""
+    def get_spending_by_party(self, ano: Optional[int] = None, limit: int = 15) -> pd.DataFrame:
+        """Return spending grouped by political party, optionally filtered by year."""
+        where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
         query = f"""
             SELECT
                 COALESCE(d.partido, 'OUTROS') as partido,
@@ -278,6 +316,7 @@ class SpendingWarehouse:
                 AVG(f.valor_liquido) as ticket_medio
             FROM fact_despesas f
             JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            {where_clause}
             GROUP BY d.partido
             ORDER BY total_valor DESC
             LIMIT {limit}
@@ -286,8 +325,9 @@ class SpendingWarehouse:
             return self.conn.execute(query).df()
         return pd.read_sql_query(query, self.conn)
 
-    def get_spending_by_uf(self, limit: int = 27) -> pd.DataFrame:
-        """Return spending grouped by Brazilian State (UF)."""
+    def get_spending_by_uf(self, ano: Optional[int] = None, limit: int = 27) -> pd.DataFrame:
+        """Return spending grouped by Brazilian State (UF), optionally filtered by year."""
+        where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
         query = f"""
             SELECT
                 COALESCE(d.uf, 'BR') as uf,
@@ -296,6 +336,7 @@ class SpendingWarehouse:
                 SUM(f.valor_liquido) as total_valor
             FROM fact_despesas f
             JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            {where_clause}
             GROUP BY d.uf
             ORDER BY total_valor DESC
             LIMIT {limit}
@@ -304,8 +345,9 @@ class SpendingWarehouse:
             return self.conn.execute(query).df()
         return pd.read_sql_query(query, self.conn)
 
-    def get_top_suppliers(self, limit: int = 15) -> pd.DataFrame:
+    def get_top_suppliers(self, ano: Optional[int] = None, limit: int = 15) -> pd.DataFrame:
         """Return top suppliers / CNPJs receiving public parliamentary funds."""
+        where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
         query = f"""
             SELECT
                 forn.nome_fornecedor,
@@ -316,6 +358,7 @@ class SpendingWarehouse:
                 MAX(f.valor_liquido) as maior_recibo
             FROM fact_despesas f
             JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+            {where_clause}
             GROUP BY forn.nome_fornecedor, forn.cnpj_cpf
             ORDER BY total_valor DESC
             LIMIT {limit}
@@ -324,8 +367,9 @@ class SpendingWarehouse:
             return self.conn.execute(query).df()
         return pd.read_sql_query(query, self.conn)
 
-    def get_deputy_ranking(self, limit: int = 25) -> pd.DataFrame:
-        """Return top spending deputies ranking."""
+    def get_deputy_ranking(self, ano: Optional[int] = None, limit: int = 25) -> pd.DataFrame:
+        """Return top spending deputies ranking, optionally filtered by year."""
+        where_clause = f"WHERE f.ano = {int(ano)}" if ano else ""
         query = f"""
             SELECT
                 d.nome,
@@ -337,6 +381,7 @@ class SpendingWarehouse:
                 MAX(f.valor_liquido) as maior_gasto
             FROM fact_despesas f
             JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            {where_clause}
             GROUP BY d.nome, d.partido, d.uf
             ORDER BY total_gasto DESC
             LIMIT {limit}
@@ -345,29 +390,14 @@ class SpendingWarehouse:
             return self.conn.execute(query).df()
         return pd.read_sql_query(query, self.conn)
 
-    def get_all_deputies(self) -> pd.DataFrame:
-        """Return all distinct deputies registered in warehouse."""
-        query = "SELECT DISTINCT id_deputado, nome, partido, uf FROM dim_deputado ORDER BY nome ASC"
+    def get_available_years(self) -> List[int]:
+        """Return all distinct years present in the warehouse sorted descending."""
+        query = "SELECT DISTINCT ano FROM fact_despesas WHERE ano IS NOT NULL ORDER BY ano DESC"
         if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
-
-    def get_monthly_timeline(self) -> pd.DataFrame:
-        """Return monthly expenditures timeline."""
-        query = """
-            SELECT
-                ano,
-                mes,
-                SUM(valor_liquido) as total_valor,
-                COUNT(*) as qtd_recibos
-            FROM fact_despesas
-            WHERE ano IS NOT NULL AND mes IS NOT NULL
-            GROUP BY ano, mes
-            ORDER BY ano ASC, mes ASC
-        """
-        if self.use_duckdb:
-            return self.conn.execute(query).df()
-        return pd.read_sql_query(query, self.conn)
+            df = self.conn.execute(query).df()
+        else:
+            df = pd.read_sql_query(query, self.conn)
+        return [int(y) for y in df["ano"].tolist()] if not df.empty else []
 
     @staticmethod
     def _classify_macro_category(tipo: str) -> str:
