@@ -24,17 +24,19 @@ except ImportError:
 class SpendingWarehouse:
     """Analytical Data Warehouse manager supporting DuckDB and SQLite."""
 
-    def __init__(self, db_path: str = "data/warehouse/gastos_dw.duckdb"):
+    def __init__(self, db_path: str = "data/warehouse/gastos_dw.duckdb", read_only: bool = False):
         self.db_path = db_path
+        self.read_only = read_only
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self.use_duckdb = HAS_DUCKDB
 
         if self.use_duckdb:
             try:
-                self.conn = duckdb.connect(self.db_path)
-                self._init_duckdb_schema()
+                self.conn = duckdb.connect(self.db_path, read_only=read_only)
+                if not read_only:
+                    self._init_duckdb_schema()
             except Exception as e:
-                logger.warning("DuckDB read-write connection failed (%s). Opening read-only...", e)
+                logger.warning("DuckDB connection failed (%s). Opening read-only...", e)
                 try:
                     self.conn = duckdb.connect(self.db_path, read_only=True)
                 except Exception as e2:
@@ -42,11 +44,13 @@ class SpendingWarehouse:
                     self.use_duckdb = False
                     self.sqlite_path = self.db_path.replace(".duckdb", ".db")
                     self.conn = sqlite3.connect(self.sqlite_path)
-                    self._init_sqlite_schema()
+                    if not read_only:
+                        self._init_sqlite_schema()
         else:
             self.sqlite_path = self.db_path.replace(".duckdb", ".db")
             self.conn = sqlite3.connect(self.sqlite_path)
-            self._init_sqlite_schema()
+            if not read_only:
+                self._init_sqlite_schema()
 
     def _init_duckdb_schema(self) -> None:
         """Create Star Schema tables in DuckDB."""
@@ -412,3 +416,213 @@ class SpendingWarehouse:
         if any(w in tipo_upper for w in ["ALIMENTAÇÃO", "REFEIÇÃO", "HOSPEDAGEM"]):
             return "DIÁRIAS & HOSPEDAGEM"
         return "OUTROS"
+
+    def get_all_deputies_list(self) -> List[Dict[str, Any]]:
+        """Return distinct list of deputies for search/filter dropdowns."""
+        query = """
+            SELECT DISTINCT
+                d.id_deputado,
+                d.nome,
+                d.partido,
+                d.uf
+            FROM dim_deputado d
+            JOIN fact_despesas f ON d.deputado_key = f.deputado_key
+            ORDER BY d.nome ASC
+        """
+        if self.use_duckdb:
+            df = self.conn.execute(query).df()
+        else:
+            df = pd.read_sql_query(query, self.conn)
+        return df.to_dict(orient="records") if not df.empty else []
+
+    def get_detailed_expenses(
+        self,
+        ano: Optional[int] = None,
+        deputado: Optional[str] = None,
+        fornecedor: Optional[str] = None,
+        categoria: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        sort_by: str = "valor_desc",
+    ) -> Dict[str, Any]:
+        """Return granular itemized expenses: who spent, what they bought, and where (supplier/CNPJ)."""
+        conditions = []
+        if ano:
+            conditions.append(f"f.ano = {int(ano)}")
+        if deputado:
+            dep_clean = deputado.replace("'", "''")
+            conditions.append(f"UPPER(d.nome) LIKE UPPER('%{dep_clean}%')")
+        if fornecedor:
+            forn_clean = fornecedor.replace("'", "''")
+            conditions.append(f"(UPPER(forn.nome_fornecedor) LIKE UPPER('%{forn_clean}%') OR forn.cnpj_cpf LIKE '%{forn_clean}%')")
+        if categoria:
+            cat_clean = categoria.replace("'", "''")
+            conditions.append(f"UPPER(c.tipo_despesa) LIKE UPPER('%{cat_clean}%')")
+        if search:
+            s_clean = search.replace("'", "''")
+            conditions.append(
+                f"(UPPER(d.nome) LIKE UPPER('%{s_clean}%') OR "
+                f"UPPER(forn.nome_fornecedor) LIKE UPPER('%{s_clean}%') OR "
+                f"forn.cnpj_cpf LIKE '%{s_clean}%' OR "
+                f"UPPER(c.tipo_despesa) LIKE UPPER('%{s_clean}%') OR "
+                f"f.num_documento LIKE '%{s_clean}%')"
+            )
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        if sort_by == "data_desc":
+            order_clause = "ORDER BY f.data_documento DESC, f.valor_liquido DESC"
+        elif sort_by == "valor_asc":
+            order_clause = "ORDER BY f.valor_liquido ASC"
+        else:
+            order_clause = "ORDER BY f.valor_liquido DESC, f.data_documento DESC"
+
+        count_query = f"""
+            SELECT COUNT(*) as total_matching
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+            JOIN dim_categoria c ON f.categoria_key = c.categoria_key
+            {where_clause}
+        """
+
+        data_query = f"""
+            SELECT
+                f.despesa_id,
+                d.id_deputado,
+                d.nome AS deputado_nome,
+                d.partido AS deputado_partido,
+                d.uf AS deputado_uf,
+                c.tipo_despesa AS categoria,
+                c.macro_categoria,
+                forn.nome_fornecedor AS fornecedor_nome,
+                forn.cnpj_cpf AS fornecedor_cnpj,
+                f.data_documento,
+                f.ano,
+                f.mes,
+                f.valor_liquido,
+                f.is_fim_de_semana,
+                f.num_documento
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+            JOIN dim_categoria c ON f.categoria_key = c.categoria_key
+            {where_clause}
+            {order_clause}
+            LIMIT {limit} OFFSET {offset}
+        """
+
+        if self.use_duckdb:
+            total_matching = int(self.conn.execute(count_query).fetchone()[0])
+            df = self.conn.execute(data_query).df()
+        else:
+            total_matching = int(pd.read_sql_query(count_query, self.conn).iloc[0, 0])
+            df = pd.read_sql_query(data_query, self.conn)
+
+        records = df.to_dict(orient="records") if not df.empty else []
+        return {
+            "total_matching": total_matching,
+            "limit": limit,
+            "offset": offset,
+            "expenses": records,
+        }
+
+    def get_deputy_profile(self, deputado_nome: str, ano: Optional[int] = None) -> Dict[str, Any]:
+        """Return comprehensive breakdown/dossier for a specific deputy (who, what, where)."""
+        dep_clean = deputado_nome.replace("'", "''")
+        where_ano = f"AND f.ano = {int(ano)}" if ano else ""
+
+        kpi_query = f"""
+            SELECT
+                d.nome,
+                d.partido,
+                d.uf,
+                COUNT(f.despesa_id) as total_recibos,
+                COALESCE(SUM(f.valor_liquido), 0.0) as total_gasto,
+                COALESCE(AVG(f.valor_liquido), 0.0) as ticket_medio,
+                COALESCE(MAX(f.valor_liquido), 0.0) as maior_gasto
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            WHERE UPPER(d.nome) = UPPER('{dep_clean}') {where_ano}
+            GROUP BY d.nome, d.partido, d.uf
+        """
+
+        suppliers_query = f"""
+            SELECT
+                forn.nome_fornecedor,
+                forn.cnpj_cpf,
+                COUNT(f.despesa_id) as qtd_recibos,
+                SUM(f.valor_liquido) as total_gasto
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+            WHERE UPPER(d.nome) = UPPER('{dep_clean}') {where_ano}
+            GROUP BY forn.nome_fornecedor, forn.cnpj_cpf
+            ORDER BY total_gasto DESC
+            LIMIT 10
+        """
+
+        categories_query = f"""
+            SELECT
+                c.tipo_despesa,
+                c.macro_categoria,
+                COUNT(f.despesa_id) as qtd_recibos,
+                SUM(f.valor_liquido) as total_gasto
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            JOIN dim_categoria c ON f.categoria_key = c.categoria_key
+            WHERE UPPER(d.nome) = UPPER('{dep_clean}') {where_ano}
+            GROUP BY c.tipo_despesa, c.macro_categoria
+            ORDER BY total_gasto DESC
+            LIMIT 10
+        """
+
+        recent_expenses_query = f"""
+            SELECT
+                f.despesa_id,
+                c.tipo_despesa AS categoria,
+                forn.nome_fornecedor,
+                forn.cnpj_cpf,
+                f.data_documento,
+                f.valor_liquido,
+                f.num_documento,
+                f.is_fim_de_semana
+            FROM fact_despesas f
+            JOIN dim_deputado d ON f.deputado_key = d.deputado_key
+            JOIN dim_fornecedor forn ON f.fornecedor_key = forn.fornecedor_key
+            JOIN dim_categoria c ON f.categoria_key = c.categoria_key
+            WHERE UPPER(d.nome) = UPPER('{dep_clean}') {where_ano}
+            ORDER BY f.valor_liquido DESC, f.data_documento DESC
+            LIMIT 25
+        """
+
+        if self.use_duckdb:
+            kpi_df = self.conn.execute(kpi_query).df()
+            sup_df = self.conn.execute(suppliers_query).df()
+            cat_df = self.conn.execute(categories_query).df()
+            rec_df = self.conn.execute(recent_expenses_query).df()
+        else:
+            kpi_df = pd.read_sql_query(kpi_query, self.conn)
+            sup_df = pd.read_sql_query(suppliers_query, self.conn)
+            cat_df = pd.read_sql_query(categories_query, self.conn)
+            rec_df = pd.read_sql_query(recent_expenses_query, self.conn)
+
+        if kpi_df.empty:
+            return {}
+
+        kpi = kpi_df.iloc[0].to_dict()
+        return {
+            "deputado": {
+                "nome": str(kpi.get("nome", "")),
+                "partido": str(kpi.get("partido", "")),
+                "uf": str(kpi.get("uf", "")),
+                "total_gasto": float(kpi.get("total_gasto", 0.0)),
+                "total_recibos": int(kpi.get("total_recibos", 0)),
+                "ticket_medio": float(kpi.get("ticket_medio", 0.0)),
+                "maior_gasto": float(kpi.get("maior_gasto", 0.0)),
+            },
+            "top_fornecedores": sup_df.to_dict(orient="records") if not sup_df.empty else [],
+            "top_categorias": cat_df.to_dict(orient="records") if not cat_df.empty else [],
+            "despesas_recentes": rec_df.to_dict(orient="records") if not rec_df.empty else [],
+        }

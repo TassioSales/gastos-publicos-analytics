@@ -35,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-warehouse = SpendingWarehouse()
+warehouse = SpendingWarehouse(read_only=True)
 pipeline = CeapPipeline()
 detector = SpendingAnomalyDetector()
 
@@ -184,6 +184,73 @@ def get_deputies_ranking(
     return records
 
 
+@app.get("/api/v1/deputies/list")
+def get_deputies_list() -> List[Dict[str, Any]]:
+    """Return distinct list of deputies for filter dropdowns."""
+    return warehouse.get_all_deputies_list()
+
+
+@app.get("/api/v1/expenses")
+def get_detailed_expenses(
+    ano: Optional[int] = Query(default=None),
+    deputado: Optional[str] = Query(default=None),
+    fornecedor: Optional[str] = Query(default=None),
+    categoria: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    sort_by: str = Query(default="valor_desc"),
+) -> Dict[str, Any]:
+    """Return granular itemized expenses: who spent, what they bought, and where (supplier/CNPJ)."""
+    res = warehouse.get_detailed_expenses(
+        ano=ano,
+        deputado=deputado,
+        fornecedor=fornecedor,
+        categoria=categoria,
+        search=search,
+        limit=limit,
+        offset=offset,
+        sort_by=sort_by,
+    )
+    cleaned_expenses = []
+    for r in res.get("expenses", []):
+        cleaned_expenses.append({
+            "despesa_id": str(r.get("despesa_id", "")),
+            "id_deputado": int(r.get("id_deputado") or 0),
+            "deputado_nome": str(r.get("deputado_nome") or "PARLAMENTAR"),
+            "deputado_partido": str(r.get("deputado_partido") or "OUTROS"),
+            "deputado_uf": str(r.get("deputado_uf") or "BR"),
+            "categoria": str(r.get("categoria") or ""),
+            "macro_categoria": str(r.get("macro_categoria") or "OUTROS"),
+            "fornecedor_nome": str(r.get("fornecedor_nome") or ""),
+            "fornecedor_cnpj": str(r.get("fornecedor_cnpj") or ""),
+            "data_documento": str(r.get("data_documento") or "")[:10],
+            "ano": int(r.get("ano") or 0),
+            "mes": int(r.get("mes") or 0),
+            "valor_liquido": float(r.get("valor_liquido") or 0.0),
+            "is_fim_de_semana": bool(r.get("is_fim_de_semana")),
+            "num_documento": str(r.get("num_documento") or ""),
+        })
+    return {
+        "total_matching": res.get("total_matching", 0),
+        "limit": limit,
+        "offset": offset,
+        "expenses": cleaned_expenses,
+    }
+
+
+@app.get("/api/v1/deputies/{deputado_nome}/profile")
+def get_deputy_profile(
+    deputado_nome: str,
+    ano: Optional[int] = Query(default=None),
+) -> Dict[str, Any]:
+    """Return comprehensive breakdown/dossier for a specific deputy (who, what, where)."""
+    profile = warehouse.get_deputy_profile(deputado_nome, ano=ano)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Parlamentar não encontrado no Data Warehouse")
+    return profile
+
+
 @app.get("/api/v1/timeline")
 def get_timeline(ano: Optional[int] = Query(default=None)) -> List[Dict[str, Any]]:
     where_clause = f"WHERE f.ano = {int(ano)}" if ano else "WHERE f.ano IS NOT NULL"
@@ -278,11 +345,12 @@ def get_anomalies(
 
 @app.post("/api/v1/etl/run")
 def trigger_etl(deputados_limit: int = Query(default=25, ge=1, le=50)) -> Dict[str, Any]:
+    writer_warehouse = SpendingWarehouse(read_only=False)
     deputados = pipeline.fetch_deputados(limit=deputados_limit)
     years = [2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
     raw = pipeline._generate_rich_multiyear_dataset(deputados, years, items_per_year=35)
     cleaned = pipeline.clean_expenses_dataframe(raw)
-    metrics = warehouse.load_dimensions_and_facts(cleaned, deputados_list=deputados)
+    metrics = writer_warehouse.load_dimensions_and_facts(cleaned, deputados_list=deputados)
 
     return {
         "status": "success",
@@ -604,10 +672,11 @@ def serve_dashboard():
                                 <th class="py-2 px-2">PARTIDO/UF</th>
                                 <th class="py-2 px-2 text-right">RECIBOS</th>
                                 <th class="py-2 px-2 text-right">TOTAL (R$)</th>
+                                <th class="py-2 px-2 text-center">DOSSIÊ</th>
                             </tr>
                         </thead>
                         <tbody id="deputies-table-body" class="divide-y divide-slate-800/60">
-                            <tr><td colspan="4" class="py-4 text-center text-slate-500">Carregando ranking...</td></tr>
+                            <tr><td colspan="5" class="py-4 text-center text-slate-500">Carregando ranking...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -635,12 +704,199 @@ def serve_dashboard():
             </div>
         </div>
 
+        <!-- DETAILED ITEM-BY-ITEM EXPENSES AUDIT: QUEM, O QUE E ONDE -->
+        <div class="glass p-6 rounded-2xl border-cyan-500/20" id="section-detalhamento">
+            <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 mb-6 pb-4 border-b border-cardBorder">
+                <div>
+                    <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+                        <i data-lucide="scan-search" class="w-6 h-6 text-cyan-400"></i>
+                        <span>Raio-X das Despesas: Nome aos Bois</span>
+                        <span class="text-xs px-2.5 py-0.5 rounded-full border border-cyan-500/30 text-cyan-400 font-mono">Quem Gastou, O Quê e Onde</span>
+                    </h2>
+                    <p class="text-xs text-slate-400 font-mono mt-1">
+                        Auditoria item a item: identificação do parlamentar (QUEM), tipo de despesa (O QUÊ) e empresa beneficiária com CNPJ (ONDE).
+                    </p>
+                </div>
+                <div id="matching-expenses-badge" class="px-3.5 py-1.5 rounded-full bg-cyan-950/60 border border-cyan-500/40 text-cyan-300 font-mono text-xs font-semibold">
+                    Carregando notas...
+                </div>
+            </div>
+
+            <!-- Search and Filter Bar -->
+            <div class="grid grid-cols-1 md:grid-cols-12 gap-3 mb-6">
+                <!-- Text search -->
+                <div class="md:col-span-5 relative">
+                    <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3.5 top-3"></i>
+                    <input type="text" id="expense-search-input" placeholder="Buscar parlamentar, fornecedor, CNPJ ou tipo de gasto..." 
+                           class="w-full bg-slate-900/90 border border-slate-700 rounded-xl pl-10 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-400 font-mono transition"
+                           onkeyup="if(event.key === 'Enter') triggerExpenseSearch()">
+                </div>
+
+                <!-- Deputy selector -->
+                <div class="md:col-span-3">
+                    <select id="expense-deputy-select" onchange="triggerExpenseSearch()"
+                            class="w-full bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-400 font-mono transition">
+                        <option value="">👤 Todos os Parlamentares</option>
+                    </select>
+                </div>
+
+                <!-- Sort selector -->
+                <div class="md:col-span-2">
+                    <select id="expense-sort-select" onchange="triggerExpenseSearch()"
+                            class="w-full bg-slate-900/90 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-400 font-mono transition">
+                        <option value="valor_desc">💰 Maior Valor (R$)</option>
+                        <option value="data_desc">📅 Mais Recente</option>
+                        <option value="valor_asc">📉 Menor Valor (R$)</option>
+                    </select>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="md:col-span-2 flex gap-2">
+                    <button onclick="triggerExpenseSearch()" class="w-full flex items-center justify-center gap-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-mono font-medium py-2 transition shadow-lg shadow-cyan-600/20">
+                        <i data-lucide="filter" class="w-3.5 h-3.5"></i>
+                        Filtrar
+                    </button>
+                    <button onclick="resetExpenseFilters()" title="Limpar Filtros" class="px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-mono transition flex items-center justify-center">
+                        <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Itemized Expenses Table -->
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs font-mono">
+                    <thead class="text-slate-400 border-b border-cardBorder pb-2">
+                        <tr>
+                            <th class="py-3 px-3">QUEM (PARLAMENTAR)</th>
+                            <th class="py-3 px-3">O QUÊ (DESPESA)</th>
+                            <th class="py-3 px-3">ONDE (FORNECEDOR / CNPJ)</th>
+                            <th class="py-3 px-3">DATA</th>
+                            <th class="py-3 px-3 text-right">VALOR (R$)</th>
+                            <th class="py-3 px-3 text-center">DOSSIÊ</th>
+                        </tr>
+                    </thead>
+                    <tbody id="detailed-expenses-body" class="divide-y divide-slate-800/60">
+                        <tr><td colspan="6" class="py-6 text-center text-slate-500">Carregando despesas detalhadas...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Pagination Bar -->
+            <div class="flex items-center justify-between pt-4 mt-4 border-t border-cardBorder text-xs font-mono text-slate-400">
+                <span id="pagination-info">Mostrando 0 de 0</span>
+                <div class="flex items-center gap-2">
+                    <button id="btn-prev-page" onclick="changeExpensePage(-1)" disabled class="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800/80 disabled:opacity-40 hover:bg-slate-700 transition">
+                        ◀ Anterior
+                    </button>
+                    <span id="current-page-num" class="px-2 font-bold text-slate-200">1</span>
+                    <button id="btn-next-page" onclick="changeExpensePage(1)" class="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800/80 disabled:opacity-40 hover:bg-slate-700 transition">
+                        Próxima ▶
+                    </button>
+                </div>
+            </div>
+        </div>
+
     </main>
 
     <!-- Footer -->
     <footer class="glass mt-12 py-6 px-6 border-t border-cardBorder text-center text-xs text-slate-500 font-mono">
         Gastos Públicos Analytics — Arquitetura Kimball Star Schema em DuckDB & Parquet • FastAPI Analytical Server • Antigravity AI
     </footer>
+
+    <!-- Deputy Dossier Modal -->
+    <div id="deputy-modal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-md hidden flex items-center justify-center p-4">
+        <div class="glass max-w-4xl w-full max-h-[90vh] overflow-y-auto rounded-3xl p-6 md:p-8 border border-cyan-500/30 relative">
+            <!-- Close button -->
+            <button onclick="closeDeputyModal()" class="absolute top-6 right-6 text-slate-400 hover:text-white bg-slate-800/80 hover:bg-slate-700 p-2 rounded-xl transition">
+                <i data-lucide="x" class="w-5 h-5"></i>
+            </button>
+
+            <!-- Deputy Dossier Header -->
+            <div class="flex items-center gap-4 mb-6 pb-6 border-b border-cardBorder">
+                <div class="w-14 h-14 rounded-2xl bg-gradient-to-tr from-cyan-600 via-sky-500 to-indigo-600 flex items-center justify-center text-white text-xl font-black font-mono shadow-xl shadow-cyan-500/20" id="modal-deputy-avatar">
+                    DP
+                </div>
+                <div>
+                    <div class="flex items-center gap-2">
+                        <h2 class="text-xl md:text-2xl font-black text-white" id="modal-deputy-name">NOME DO PARLAMENTAR</h2>
+                        <span class="px-2.5 py-0.5 rounded-full bg-cyan-950/80 border border-cyan-500/50 text-cyan-300 font-mono text-xs font-bold" id="modal-deputy-badge">
+                            PARTIDO / UF
+                        </span>
+                    </div>
+                    <p class="text-xs text-slate-400 font-mono mt-1">Dossiê de Transparência Parlamentar — Cota para Exercício da Atividade Parlamentar (CEAP)</p>
+                </div>
+            </div>
+
+            <!-- Modal Deputy KPIs -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+                <div class="p-4 rounded-xl bg-slate-900/70 border border-slate-800">
+                    <span class="text-[10px] font-mono text-slate-400 block mb-1">TOTAL GASTO</span>
+                    <span class="text-base md:text-lg font-bold text-cyan-400 font-mono" id="modal-total-gasto">R$ 0,00</span>
+                </div>
+                <div class="p-4 rounded-xl bg-slate-900/70 border border-slate-800">
+                    <span class="text-[10px] font-mono text-slate-400 block mb-1">TOTAL DE NOTAS</span>
+                    <span class="text-base md:text-lg font-bold text-white font-mono" id="modal-total-recibos">0</span>
+                </div>
+                <div class="p-4 rounded-xl bg-slate-900/70 border border-slate-800">
+                    <span class="text-[10px] font-mono text-slate-400 block mb-1">TICKET MÉDIO</span>
+                    <span class="text-base md:text-lg font-bold text-purple-400 font-mono" id="modal-ticket-medio">R$ 0,00</span>
+                </div>
+                <div class="p-4 rounded-xl bg-slate-900/70 border border-slate-800">
+                    <span class="text-[10px] font-mono text-slate-400 block mb-1">MAIOR NOTA FISCAL</span>
+                    <span class="text-base md:text-lg font-bold text-rose-400 font-mono" id="modal-maior-gasto">R$ 0,00</span>
+                </div>
+            </div>
+
+            <!-- Modal Breakdown Grids: Onde Gastou vs O Que Comprou -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                <!-- Onde Gastou (Top Fornecedores) -->
+                <div class="p-5 rounded-2xl bg-slate-900/50 border border-slate-800">
+                    <h3 class="text-xs font-bold text-slate-200 flex items-center gap-2 mb-3 font-mono">
+                        <i data-lucide="building" class="w-4 h-4 text-emerald-400"></i>
+                        ONDE GASTOU (TOP FORNECEDORES)
+                    </h3>
+                    <div id="modal-suppliers-list" class="space-y-2 text-xs font-mono max-h-56 overflow-y-auto pr-1">
+                        <div class="text-slate-500">Carregando fornecedores...</div>
+                    </div>
+                </div>
+
+                <!-- O Que Comprou (Top Categorias) -->
+                <div class="p-5 rounded-2xl bg-slate-900/50 border border-slate-800">
+                    <h3 class="text-xs font-bold text-slate-200 flex items-center gap-2 mb-3 font-mono">
+                        <i data-lucide="tag" class="w-4 h-4 text-amber-400"></i>
+                        O QUE COMPROU (TOP CATEGORIAS)
+                    </h3>
+                    <div id="modal-categories-list" class="space-y-2 text-xs font-mono max-h-56 overflow-y-auto pr-1">
+                        <div class="text-slate-500">Carregando categorias...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modal Extrato de Notas -->
+            <div>
+                <h3 class="text-xs font-bold text-slate-200 flex items-center gap-2 mb-3 font-mono">
+                    <i data-lucide="receipt" class="w-4 h-4 text-cyan-400"></i>
+                    EXTRATO DE NOTAS FISCAIS DO PARLAMENTAR (MAIORES VALORES)
+                </h3>
+                <div class="overflow-x-auto max-h-64 rounded-xl border border-slate-800">
+                    <table class="w-full text-left text-xs font-mono">
+                        <thead class="bg-slate-900/90 text-slate-400 sticky top-0 border-b border-slate-800">
+                            <tr>
+                                <th class="py-2.5 px-3">DATA</th>
+                                <th class="py-2.5 px-3">CATEGORIA</th>
+                                <th class="py-2.5 px-3">FORNECEDOR</th>
+                                <th class="py-2.5 px-3">DOC / NOTA</th>
+                                <th class="py-2.5 px-3 text-right">VALOR</th>
+                            </tr>
+                        </thead>
+                        <tbody id="modal-receipts-body" class="divide-y divide-slate-800/60 bg-slate-950/40">
+                            <tr><td colspan="5" class="py-4 text-center text-slate-500">Carregando extrato...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- Interactive Front-End Engine -->
     <script>
@@ -915,17 +1171,23 @@ def serve_dashboard():
                 .then(data => {
                     const tbody = document.getElementById('deputies-table-body');
                     if (!data || data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="4" class="py-4 text-center text-slate-500">Nenhum parlamentar registrado neste ano.</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">Nenhum parlamentar registrado neste ano.</td></tr>';
                         return;
                     }
                     tbody.innerHTML = data.map(d => `
-                        <tr class="hover:bg-slate-800/30">
-                            <td class="py-2 px-2 text-white font-medium">${d.nome}</td>
+                        <tr class="hover:bg-slate-800/30 transition">
+                            <td class="py-2 px-2 text-white font-medium hover:text-cyan-400 cursor-pointer" onclick="openDeputyModal('${d.nome}')">${d.nome}</td>
                             <td class="py-2 px-2 text-cyan-400 font-bold">${d.partido}/${d.uf}</td>
                             <td class="py-2 px-2 text-right text-slate-400">${Number(d.qtd_recibos).toLocaleString('pt-BR')}</td>
                             <td class="py-2 px-2 text-right font-bold text-slate-200">${formatBRL(d.total_gasto)}</td>
+                            <td class="py-2 px-2 text-center">
+                                <button onclick="openDeputyModal('${d.nome}')" class="px-2 py-0.5 rounded text-[10px] bg-cyan-950/80 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500 hover:text-white transition inline-flex items-center gap-1 font-mono">
+                                    <i data-lucide="user" class="w-3 h-3"></i> Dossiê
+                                </button>
+                            </td>
                         </tr>
                     `).join('');
+                    lucide.createIcons();
                 });
 
             // 8. Top Suppliers Table
@@ -945,7 +1207,267 @@ def serve_dashboard():
                         </tr>
                     `).join('');
                 });
+
+            // 9. Load detailed expenses & dropdowns
+            loadDeputiesDropdown();
+            loadDetailedExpenses(1);
         }
+
+        // ====================================================================
+        // ITEM-BY-ITEM EXPENSES ENGINE & DEPUTY DOSSIER MODAL
+        // ====================================================================
+        let currentExpensePage = 1;
+        const expensePageSize = 25;
+        let totalExpenseRecords = 0;
+        let deputiesLoaded = false;
+
+        function loadDeputiesDropdown() {
+            if (deputiesLoaded) return;
+            fetch('/api/v1/deputies/list')
+                .then(r => r.json())
+                .then(list => {
+                    const sel = document.getElementById('expense-deputy-select');
+                    sel.innerHTML = '<option value="">👤 Todos os Parlamentares</option>';
+                    list.forEach(d => {
+                        const opt = document.createElement('option');
+                        opt.value = d.nome;
+                        opt.innerText = `${d.nome} (${d.partido}/${d.uf})`;
+                        sel.appendChild(opt);
+                    });
+                    deputiesLoaded = true;
+                })
+                .catch(err => console.error('Error loading deputies list:', err));
+        }
+
+        function loadDetailedExpenses(page = 1) {
+            currentExpensePage = page;
+            const searchVal = document.getElementById('expense-search-input').value.trim();
+            const depVal = document.getElementById('expense-deputy-select').value;
+            const sortVal = document.getElementById('expense-sort-select').value;
+            const offset = (page - 1) * expensePageSize;
+
+            let url = `/api/v1/expenses?limit=${expensePageSize}&offset=${offset}&sort_by=${sortVal}`;
+            if (activeYear) url += `&ano=${activeYear}`;
+            if (searchVal) url += `&search=${encodeURIComponent(searchVal)}`;
+            if (depVal) url += `&deputado=${encodeURIComponent(depVal)}`;
+
+            const tbody = document.getElementById('detailed-expenses-body');
+            tbody.innerHTML = '<tr><td colspan="6" class="py-6 text-center text-slate-400 font-mono">Buscando notas fiscais no DuckDB...</td></tr>';
+
+            fetch(url)
+                .then(r => r.json())
+                .then(res => {
+                    const total = res.total_matching || 0;
+                    totalExpenseRecords = total;
+                    const expenses = res.expenses || [];
+
+                    document.getElementById('matching-expenses-badge').innerText = `📄 ${total.toLocaleString('pt-BR')} NOTAS ENCONTRADAS`;
+
+                    const totalPages = Math.ceil(total / expensePageSize) || 1;
+                    const startIdx = total === 0 ? 0 : offset + 1;
+                    const endIdx = Math.min(offset + expenses.length, total);
+                    document.getElementById('pagination-info').innerText = `Mostrando ${startIdx} a ${endIdx} de ${total.toLocaleString('pt-BR')} despesas auditadas`;
+                    document.getElementById('current-page-num').innerText = `${page} / ${totalPages}`;
+
+                    document.getElementById('btn-prev-page').disabled = (page <= 1);
+                    document.getElementById('btn-next-page').disabled = (page >= totalPages);
+
+                    if (expenses.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="6" class="py-8 text-center text-slate-500 font-mono">Nenhuma despesa localizada com os filtros selecionados.</td></tr>';
+                        return;
+                    }
+
+                    tbody.innerHTML = expenses.map(e => `
+                        <tr class="hover:bg-slate-800/40 transition">
+                            <td class="py-3 px-3">
+                                <div class="font-bold text-white hover:text-cyan-400 cursor-pointer" onclick="openDeputyModal('${e.deputado_nome}')">${e.deputado_nome}</div>
+                                <div class="flex items-center gap-1.5 mt-0.5">
+                                    <span class="px-1.5 py-0.2 rounded text-[10px] bg-cyan-950/80 border border-cyan-500/40 text-cyan-300 font-mono font-bold">${e.deputado_partido}/${e.deputado_uf}</span>
+                                    <button onclick="filterByDeputyFromRow('${e.deputado_nome}')" class="text-[10px] text-slate-400 hover:text-cyan-300 underline font-mono">filtrar este</button>
+                                </div>
+                            </td>
+                            <td class="py-3 px-3 max-w-xs">
+                                <div class="text-slate-200 font-medium truncate" title="${e.categoria}">${e.categoria}</div>
+                                <div class="text-[10px] text-amber-400 font-mono mt-0.5 flex items-center gap-1">
+                                    <span>${e.macro_categoria}</span>
+                                    ${e.num_documento ? `<span class="text-slate-500">• NF ${e.num_documento}</span>` : ''}
+                                </div>
+                            </td>
+                            <td class="py-3 px-3 max-w-xs">
+                                <div class="text-slate-200 font-medium truncate" title="${e.fornecedor_nome}">${e.fornecedor_nome}</div>
+                                <div class="text-[10px] text-slate-400 font-mono">${e.fornecedor_cnpj || 'CNPJ NÃO INFORMADO'}</div>
+                            </td>
+                            <td class="py-3 px-3 whitespace-nowrap text-slate-300 font-mono">
+                                <div>${e.data_documento || ''}</div>
+                                ${e.is_fim_de_semana ? '<span class="text-[9px] px-1 rounded bg-rose-950 border border-rose-500/50 text-rose-300">FIM DE SEMANA</span>' : ''}
+                            </td>
+                            <td class="py-3 px-3 text-right font-black font-mono ${e.valor_liquido > 10000 ? 'text-rose-400' : e.valor_liquido > 3000 ? 'text-amber-400' : 'text-emerald-400'}">
+                                ${formatBRL(e.valor_liquido)}
+                            </td>
+                            <td class="py-3 px-3 text-center">
+                                <button onclick="openDeputyModal('${e.deputado_nome}')" class="px-2.5 py-1 rounded-lg text-[10px] bg-cyan-950/80 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500 hover:text-white transition inline-flex items-center gap-1 font-mono">
+                                    <i data-lucide="user" class="w-3 h-3"></i> Dossiê
+                                </button>
+                            </td>
+                        </tr>
+                    `).join('');
+                    lucide.createIcons();
+                })
+                .catch(err => {
+                    tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-rose-400 font-mono">Erro ao carregar despesas: ${err}</td></tr>`;
+                });
+        }
+
+        function triggerExpenseSearch() {
+            loadDetailedExpenses(1);
+        }
+
+        function resetExpenseFilters() {
+            document.getElementById('expense-search-input').value = '';
+            document.getElementById('expense-deputy-select').value = '';
+            document.getElementById('expense-sort-select').value = 'valor_desc';
+            loadDetailedExpenses(1);
+        }
+
+        function changeExpensePage(delta) {
+            const newPage = currentExpensePage + delta;
+            if (newPage >= 1) {
+                loadDetailedExpenses(newPage);
+            }
+        }
+
+        function filterByDeputyFromRow(depName) {
+            const sel = document.getElementById('expense-deputy-select');
+            sel.value = depName;
+            triggerExpenseSearch();
+            document.getElementById('section-detalhamento').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function openDeputyModal(deputyName) {
+            const modal = document.getElementById('deputy-modal');
+            const cleanName = deputyName.trim();
+            const yearParam = activeYear ? `?ano=${activeYear}` : '';
+
+            // Set temporary loading state
+            document.getElementById('modal-deputy-name').innerText = cleanName;
+            document.getElementById('modal-deputy-badge').innerText = 'CARREGANDO...';
+            document.getElementById('modal-total-gasto').innerText = '...';
+            document.getElementById('modal-total-recibos').innerText = '...';
+            document.getElementById('modal-ticket-medio').innerText = '...';
+            document.getElementById('modal-maior-gasto').innerText = '...';
+            document.getElementById('modal-suppliers-list').innerHTML = '<div class="text-slate-500 py-3">Carregando fornecedores...</div>';
+            document.getElementById('modal-categories-list').innerHTML = '<div class="text-slate-500 py-3">Carregando categorias...</div>';
+            document.getElementById('modal-receipts-body').innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">Carregando extrato...</td></tr>';
+
+            const initials = cleanName.split(' ').filter(Boolean).slice(0, 2).map(n => n[0]).join('').toUpperCase() || 'DP';
+            document.getElementById('modal-deputy-avatar').innerText = initials;
+
+            modal.classList.remove('hidden');
+
+            fetch(`/api/v1/deputies/${encodeURIComponent(cleanName)}/profile${yearParam}`)
+                .then(r => {
+                    if (!r.ok) throw new Error('Não encontrado');
+                    return r.json();
+                })
+                .then(profile => {
+                    const dep = profile.deputado || {};
+                    document.getElementById('modal-deputy-badge').innerText = `${dep.partido || 'OUTROS'} / ${dep.uf || 'BR'}`;
+                    document.getElementById('modal-total-gasto').innerText = formatBRL(dep.total_gasto);
+                    document.getElementById('modal-total-recibos').innerText = Number(dep.total_recibos).toLocaleString('pt-BR');
+                    document.getElementById('modal-ticket-medio').innerText = formatBRL(dep.ticket_medio);
+                    document.getElementById('modal-maior-gasto').innerText = formatBRL(dep.maior_gasto);
+
+                    // Render Top Suppliers (Onde Gastou)
+                    const sups = profile.top_fornecedores || [];
+                    const maxSup = sups.length > 0 ? sups[0].total_gasto : 1;
+                    const supsList = document.getElementById('modal-suppliers-list');
+                    if (sups.length === 0) {
+                        supsList.innerHTML = '<div class="text-slate-500">Nenhum fornecedor registrado.</div>';
+                    } else {
+                        supsList.innerHTML = sups.map(s => {
+                            const pct = Math.min(100, Math.round((s.total_gasto / maxSup) * 100));
+                            return `
+                                <div class="p-2 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                                    <div class="flex items-center justify-between gap-2 mb-1">
+                                        <span class="font-bold text-white truncate max-w-xs" title="${s.nome_fornecedor}">${s.nome_fornecedor}</span>
+                                        <span class="font-bold text-emerald-400 whitespace-nowrap">${formatBRL(s.total_gasto)}</span>
+                                    </div>
+                                    <div class="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                                        <span>CNPJ: ${s.cnpj_cpf || 'N/A'}</span>
+                                        <span>${s.qtd_recibos} recibos</span>
+                                    </div>
+                                    <div class="w-full bg-slate-700/50 h-1 rounded-full overflow-hidden">
+                                        <div class="bg-emerald-400 h-full rounded-full" style="width: ${pct}%"></div>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                    }
+
+                    // Render Top Categories (O Que Comprou)
+                    const cats = profile.top_categorias || [];
+                    const maxCat = cats.length > 0 ? cats[0].total_gasto : 1;
+                    const catsList = document.getElementById('modal-categories-list');
+                    if (cats.length === 0) {
+                        catsList.innerHTML = '<div class="text-slate-500">Nenhuma categoria registrada.</div>';
+                    } else {
+                        catsList.innerHTML = cats.map(c => {
+                            const pct = Math.min(100, Math.round((c.total_gasto / maxCat) * 100));
+                            return `
+                                <div class="p-2 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                                    <div class="flex items-center justify-between gap-2 mb-1">
+                                        <span class="font-bold text-white truncate max-w-xs" title="${c.tipo_despesa}">${c.tipo_despesa}</span>
+                                        <span class="font-bold text-amber-400 whitespace-nowrap">${formatBRL(c.total_gasto)}</span>
+                                    </div>
+                                    <div class="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                                        <span class="text-cyan-400">${c.macro_categoria}</span>
+                                        <span>${c.qtd_recibos} recibos</span>
+                                    </div>
+                                    <div class="w-full bg-slate-700/50 h-1 rounded-full overflow-hidden">
+                                        <div class="bg-amber-400 h-full rounded-full" style="width: ${pct}%"></div>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                    }
+
+                    // Render Recent/Top Receipts
+                    const recs = profile.despesas_recentes || [];
+                    const recBody = document.getElementById('modal-receipts-body');
+                    if (recs.length === 0) {
+                        recBody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">Nenhuma nota fiscal encontrada.</td></tr>';
+                    } else {
+                        recBody.innerHTML = recs.map(r => `
+                            <tr class="hover:bg-slate-800/40 transition">
+                                <td class="py-2 px-3 text-slate-300 whitespace-nowrap">${r.data_documento || ''}</td>
+                                <td class="py-2 px-3 text-white max-w-xs truncate" title="${r.categoria}">${r.categoria}</td>
+                                <td class="py-2 px-3 text-slate-300 max-w-xs truncate" title="${r.nome_fornecedor}">${r.nome_fornecedor}</td>
+                                <td class="py-2 px-3 text-slate-400 font-mono text-[11px]">${r.num_documento || 'S/N'}</td>
+                                <td class="py-2 px-3 text-right font-bold text-cyan-400">${formatBRL(r.valor_liquido)}</td>
+                            </tr>
+                        `).join('');
+                    }
+                    lucide.createIcons();
+                })
+                .catch(err => {
+                    document.getElementById('modal-deputy-badge').innerText = 'ERRO';
+                    document.getElementById('modal-receipts-body').innerHTML = `<tr><td colspan="5" class="py-4 text-center text-rose-400 font-mono">Falha ao obter dossiê: ${err}</td></tr>`;
+                });
+        }
+
+        function closeDeputyModal() {
+            document.getElementById('deputy-modal').classList.add('hidden');
+        }
+
+        // Close modal when clicking on overlay outside
+        document.getElementById('deputy-modal').addEventListener('click', function(e) {
+            if (e.target === this) closeDeputyModal();
+        });
+
+        // Close on Escape key
+        window.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeDeputyModal();
+        });
 
         function triggerETL() {
             const btn = document.getElementById('btn-etl');
