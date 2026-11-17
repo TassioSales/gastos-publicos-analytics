@@ -1,0 +1,46 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenv
+venv/
+.venv/
+ENV/
+
+# Data and SQLite/DuckDB databases
+*.db
+*.duckdb
+*.parquet
+*.sqlite3
+data/warehouse/*.duckdb
+data/warehouse/*.parquet
+data/raw/*.csv
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
